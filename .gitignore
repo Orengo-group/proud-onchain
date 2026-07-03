@@ -1,0 +1,21 @@
+# Soroban / Rust build artefacts
+target/
+contracts/target/
+
+# Local testnet config (contains key aliases — copy from testnet.example.toml)
+configs/testnet.toml
+
+# Compiled WASM output checked in separately if needed
+*.wasm
+
+# Rust lock file for contracts (committed for reproducible builds)
+# Uncomment to ignore: contracts/Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
