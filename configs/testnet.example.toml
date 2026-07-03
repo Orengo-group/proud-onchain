@@ -1,0 +1,39 @@
+# PROUD On-Chain — Testnet Configuration Example
+#
+# Copy this file to configs/testnet.toml and fill in YOUR values.
+# Never commit configs/testnet.toml — it is in .gitignore.
+#
+# Usage:
+#   cp configs/testnet.example.toml configs/testnet.toml
+#   # Edit testnet.toml with your key alias and contract IDs
+#   source scripts/configure-testnet.sh
+
+[network]
+# Stellar testnet RPC endpoint (public, no auth required)
+rpc_url = "https://soroban-testnet.stellar.org"
+
+# Official Stellar testnet network passphrase — do NOT change this value
+network_passphrase = "Test SDF Network ; September 2015"
+
+# Horizon API endpoint for account info and friendbot funding
+horizon_url = "https://horizon-testnet.stellar.org"
+
+# Friendly name registered with `stellar network add`
+network_name = "testnet"
+
+[identity]
+# Alias of the key you created with `stellar keys generate`
+# The actual secret key is stored in ~/.config/stellar/identity/ — NOT here
+key_alias = "my-key"
+
+# YOUR testnet public key (G...)
+# Replace with the output of: stellar keys address my-key
+public_key = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+
+[contracts]
+# Contract IDs are populated after running `stellar contract deploy`
+# Leave blank until you have deployed the contracts to testnet
+rewards              = ""
+identity_registry    = ""
+campaign_vault       = ""
+achievement_certificate = ""
