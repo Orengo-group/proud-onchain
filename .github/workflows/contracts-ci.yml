@@ -1,0 +1,87 @@
+name: Contracts CI
+
+# Runs formatting checks, linting, and tests for all Soroban smart contracts
+# on every push and pull request targeting the main branch.
+# No private secrets are required for this workflow.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  # Matches the channel in rust-toolchain.toml
+  RUST_TOOLCHAIN: "1.81.0"
+
+jobs:
+  contracts-ci:
+    name: Format · Lint · Test
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: contracts
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout repository
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Install the pinned Rust toolchain with required components
+      # -----------------------------------------------------------------------
+      - name: Install Rust toolchain (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy, rust-src
+
+      # -----------------------------------------------------------------------
+      # 3. Cache Cargo registry and build artifacts to speed up subsequent runs
+      # -----------------------------------------------------------------------
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+            ${{ runner.os }}-cargo-
+
+      # -----------------------------------------------------------------------
+      # 4. Check formatting
+      # -----------------------------------------------------------------------
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # -----------------------------------------------------------------------
+      # 5. Run clippy (warnings treated as errors)
+      # -----------------------------------------------------------------------
+      - name: Lint (clippy)
+        run: |
+          cargo clippy \
+            --all-targets \
+            --all-features \
+            -- \
+            -D warnings
+
+      # -----------------------------------------------------------------------
+      # 6. Run contract tests
+      # -----------------------------------------------------------------------
+      - name: Run contract tests
+        run: cargo test --all
+
+      # -----------------------------------------------------------------------
+      # 7. Build WASM artifacts (validates the release profile compiles)
+      # -----------------------------------------------------------------------
+      - name: Build WASM artifacts
+        run: cargo build --target wasm32-unknown-unknown --release
