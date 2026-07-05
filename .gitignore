@@ -11,6 +11,12 @@ configs/testnet.toml
 # Rust lock file for contracts (committed for reproducible builds)
 # Uncomment to ignore: contracts/Cargo.lock
 
+# Local environment files — copy .env.example to .env and fill in your values
+# NEVER commit files that contain real private keys or secrets
+.env
+.env.local
+.env.*.local
+
 # OS
 .DS_Store
 Thumbs.db
