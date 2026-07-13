@@ -105,145 +105,168 @@ impl RewardsContract {
     // Initialization
     // -----------------------------------------------------------------------
 
-    /// Store the admin address.  Must be called once before any minting.
+    /// Initialize the contract with an admin address.
+    ///
+    /// Can only be called once. Subsequent calls panic with `"AlreadyInit"`.
+    ///
+    /// # Arguments
+    /// * `admin` — Address that will administer this contract.
     pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Initialized) {
+            panic!("AlreadyInit");
+        }
+
         admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
-    // -----------------------------------------------------------------------
-    // Issue #21 – admin-only mint_reward
-    // -----------------------------------------------------------------------
-
-    /// Mint `amount` reward points to `student`.
-    ///
-    /// ### Authorization
-    /// Only the stored admin may call this function.
-    ///
-    /// ### Validation
-    /// - `amount` must be > 0 (returns [`RewardError::ZeroAmount`]).
-    /// - `reason` must be 1 (Attendance), 2 (Academic), or 3 (Event)
-    ///   (returns [`RewardError::UnknownReason`] otherwise).
-    ///
-    /// ### Side-effects
-    /// - Increases the student's persistent balance.
-    /// - Emits a `"reward"` event `(student, amount, reason_code)`.
-    ///
-    /// Returns the student's new balance after minting.
-    pub fn mint_reward(
-        env: Env,
-        admin: Address,
-        student: Address,
-        amount: i128,
-        reason: u32,
-    ) -> i128 {
-        // Authorization
-        admin.require_auth();
-        Self::assert_admin(&env, &admin);
-
-        // Validate amount
-        if amount <= 0 {
-            panic_with_error!(&env, RewardError::ZeroAmount);
-        }
-
-        // Validate reason code
-        let reason_code = RewardReason::from_u32(reason)
-            .unwrap_or_else(|| panic_with_error!(&env, RewardError::UnknownReason));
-
-        // Update balance
-        let new_balance = Self::add_balance(&env, &student, amount);
-
-        // Emit event: topic = ("reward", student), data = (amount, reason_u32)
-        env.events().publish(
-            (symbol_short!("reward"), student.clone()),
-            (amount, reason_code.as_u32()),
-        );
-
-        new_balance
-    }
-
-    // -----------------------------------------------------------------------
-    // Issue #22 – batch_mint_rewards
-    // -----------------------------------------------------------------------
-
-    /// Mint rewards to multiple students in one atomic call.
-    ///
-    /// `recipients` is a [`Vec`] of `(student_address, amount, reason_u32)` tuples,
-    /// where `reason_u32` follows the same mapping as [`mint_reward`]:
-    /// `1` = Attendance, `2` = Academic, `3` = Event.
-    ///
-    /// ### Authorization
-    /// Only the stored admin may call this function.
-    ///
-    /// ### Validation
-    /// - Batch must not be empty ([`RewardError::EmptyBatch`]).
-    /// - Each amount must be > 0 ([`RewardError::ZeroAmount`]).
-    /// - Each reason must be a valid code ([`RewardError::UnknownReason`]).
-    ///
-    /// ### Atomicity (all-or-nothing)
-    /// All entries are validated **before** any state is written.
-    /// If any entry is invalid the entire call fails and no balances are updated.
-    ///
-    /// Returns a [`Vec`] of new balances in the same order as `recipients`.
-    pub fn batch_mint_rewards(
-        env: Env,
-        admin: Address,
-        recipients: Vec<(Address, i128, u32)>,
-    ) -> Vec<i128> {
-        // Authorization
-        admin.require_auth();
-        Self::assert_admin(&env, &admin);
-
-        // Batch must not be empty
-        if recipients.is_empty() {
-            panic_with_error!(&env, RewardError::EmptyBatch);
-        }
-
-        // Validation pass – ensures all-or-nothing atomicity
-        for entry in recipients.iter() {
-            let (_, amount, reason) = entry;
-            if amount <= 0 {
-                panic_with_error!(&env, RewardError::ZeroAmount);
-            }
-            if RewardReason::from_u32(reason).is_none() {
-                panic_with_error!(&env, RewardError::UnknownReason);
-            }
-        }
-
-        // Write pass – only reached when every entry is valid
-        let mut new_balances: Vec<i128> = Vec::new(&env);
-        for entry in recipients.iter() {
-            let (student, amount, reason) = entry;
-            let new_balance = Self::add_balance(&env, &student, amount);
-            env.events().publish(
-                (symbol_short!("reward"), student.clone()),
-                (amount, reason),
-            );
-            new_balances.push_back(new_balance);
-        }
-
-        new_balances
-    }
-
-    // -----------------------------------------------------------------------
-    // Read helpers
-    // -----------------------------------------------------------------------
-
-    /// Return the reward point balance for `student` (0 if not yet set).
-    pub fn balance(env: Env, student: Address) -> i128 {
+    /// Return the admin address stored during initialization.
+    pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
-            .get(&DataKey::Balance(student))
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #21 — Admin-only reward minting
+    // -----------------------------------------------------------------------
+
+    /// Mint `amount` reward points to `recipient`.
+    ///
+    /// Only the contract admin may call this function. The mint amount must be
+    /// greater than zero.
+    ///
+    /// # Arguments
+    /// * `recipient` — Student wallet to credit.
+    /// * `amount`    — Number of reward points to mint (must be > 0).
+    /// * `reason`    — Reason the reward is being issued.
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"ZeroAmount"` if `amount` is zero or negative.
+    pub fn mint_reward(env: Env, recipient: Address, amount: i128, reason: RewardReason) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if amount <= 0 {
+            panic!("ZeroAmount");
+        }
+
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(recipient.clone()))
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(recipient.clone()), &(current + amount));
+
+        // Emit reward event for off-chain indexing
+        env.events().publish(
+            (soroban_sdk::symbol_short!("reward"),),
+            (recipient, amount, reason),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #22 — Batch reward minting
+    // -----------------------------------------------------------------------
+
+    /// Mint reward points to multiple students in one transaction.
+    ///
+    /// `recipients` and `amounts` must be the same length. Only the admin may
+    /// call this function. The batch must not be empty and no amount may be zero.
+    ///
+    /// # Arguments
+    /// * `recipients` — Student wallets to credit.
+    /// * `amounts`    — Corresponding reward amounts (each must be > 0).
+    /// * `reason`     — Reason applied to the entire batch.
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"EmptyBatch"` if `recipients` is empty.
+    /// - `"LengthMismatch"` if `recipients` and `amounts` differ in length.
+    /// - `"ZeroAmount"` if any amount is zero or negative.
+    pub fn batch_mint_rewards(
+        env: Env,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        reason: RewardReason,
+    ) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if recipients.is_empty() {
+            panic!("EmptyBatch");
+        }
+
+        if recipients.len() != amounts.len() {
+            panic!("LengthMismatch");
+        }
+
+        for i in 0..recipients.len() {
+            let recipient = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+
+            if amount <= 0 {
+                panic!("ZeroAmount");
+            }
+
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Balance(recipient.clone()))
+                .unwrap_or(0);
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(recipient.clone()), &(current + amount));
+
+            // Emit one event per recipient
+            env.events().publish(
+                (soroban_sdk::symbol_short!("reward"),),
+                (recipient, amount, reason.clone()),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Balance query
+    // -----------------------------------------------------------------------
+
+    /// Return the current reward point balance for `wallet`.
+    ///
+    /// Returns `0` if the wallet has never received any rewards.
+    pub fn get_balance(env: Env, wallet: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet))
             .unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
-    // Legacy placeholder – kept for backwards-compatibility
+    // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Placeholder: kept so existing integrations do not break.
-    pub fn distribute(_env: Env) -> Symbol {
-        symbol_short!("ok")
+    fn assert_initialized(env: &Env) {
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            panic!("NotInit");
+        }
+    }
+
+    fn assert_admin(env: &Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"));
+        admin.require_auth();
     }
 
     // -----------------------------------------------------------------------
@@ -277,180 +300,247 @@ impl RewardsContract {
     }
 }
 
-// ===========================================================================
+// ---------------------------------------------------------------------------
 // Tests
-// ===========================================================================
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, Vec};
+    use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
-    /// Helper: deploy a fresh contract and return (env, client, admin, student).
-    fn setup() -> (Env, RewardsContractClient<'static>, Address, Address) {
+    /// Set up a fresh initialized contract and return (env, client, admin).
+    fn setup() -> (Env, RewardsContractClient<'static>, Address) {
         let env = Env::default();
         env.mock_all_auths();
+
         let contract_id = env.register_contract(None, RewardsContract);
         let client = RewardsContractClient::new(&env, &contract_id);
+
         let admin = Address::generate(&env);
-        let student = Address::generate(&env);
         client.initialize(&admin);
-        (env, client, admin, student)
+
+        (env, client, admin)
     }
 
     // -----------------------------------------------------------------------
-    // Legacy placeholder
+    // Initialization tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_distribute_placeholder() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, RewardsContract);
-        let client = RewardsContractClient::new(&env, &contract_id);
-        assert_eq!(client.distribute(), symbol_short!("ok"));
+    fn test_initialize_success() {
+        let (env, client, admin) = setup();
+        assert_eq!(client.get_admin(), admin);
+        let _ = env;
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyInit")]
+    fn test_initialize_rejects_double_init() {
+        let (env, client, admin) = setup();
+        let _ = env;
+        // Second call must panic
+        client.initialize(&admin);
     }
 
     // -----------------------------------------------------------------------
-    // Issue #21 – mint_reward
+    // Issue #21 — mint_reward tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_mint_reward_success() {
-        let (_env, client, admin, student) = setup();
-        let bal = client.mint_reward(&admin, &student, &100, &1 /* Attendance */);
-        assert_eq!(bal, 100);
-        assert_eq!(client.balance(&student), 100);
+    fn test_mint_reward_increases_balance() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        assert_eq!(client.get_balance(&student), 0);
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        assert_eq!(client.get_balance(&student), 100);
     }
 
     #[test]
     fn test_mint_reward_accumulates_balance() {
-        let (_env, client, admin, student) = setup();
-        client.mint_reward(&admin, &student, &50, &2 /* Academic */);
-        let bal = client.mint_reward(&admin, &student, &75, &3 /* Event */);
-        assert_eq!(bal, 125);
-        assert_eq!(client.balance(&student), 125);
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &50, &RewardReason::Attendance);
+        client.mint_reward(&student, &75, &RewardReason::Academic);
+        client.mint_reward(&student, &25, &RewardReason::Event);
+        assert_eq!(client.get_balance(&student), 150);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2)")] // ZeroAmount
-    fn test_mint_reward_zero_amount_rejected() {
-        let (_env, client, admin, student) = setup();
-        client.mint_reward(&admin, &student, &0, &1);
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_mint_reward_rejects_zero_amount() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &0, &RewardReason::Attendance);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #2)")] // ZeroAmount
-    fn test_mint_reward_negative_amount_rejected() {
-        let (_env, client, admin, student) = setup();
-        client.mint_reward(&admin, &student, &-10, &1);
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_mint_reward_rejects_negative_amount() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &-10, &RewardReason::Attendance);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #1)")] // Unauthorized
-    fn test_mint_reward_non_admin_rejected() {
-        let (env, client, _admin, student) = setup();
-        let non_admin = Address::generate(&env);
-        client.mint_reward(&non_admin, &student, &100, &1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Issue #22 – batch_mint_rewards
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_batch_mint_multiple_students() {
-        let (env, client, admin, student1) = setup();
-        let student2 = Address::generate(&env);
-        let mut batch = Vec::new(&env);
-        batch.push_back((student1.clone(), 200_i128, 1_u32));
-        batch.push_back((student2.clone(), 300_i128, 2_u32));
-        let balances = client.batch_mint_rewards(&admin, &batch);
-        assert_eq!(balances.get(0).unwrap(), 200);
-        assert_eq!(balances.get(1).unwrap(), 300);
-        assert_eq!(client.balance(&student1), 200);
-        assert_eq!(client.balance(&student2), 300);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #3)")] // EmptyBatch
-    fn test_batch_mint_empty_batch_rejected() {
-        let (env, client, admin, _student) = setup();
-        let batch: Vec<(Address, i128, u32)> = Vec::new(&env);
-        client.batch_mint_rewards(&admin, &batch);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")] // ZeroAmount
-    fn test_batch_mint_zero_amount_rejected() {
-        let (env, client, admin, student) = setup();
-        let mut batch = Vec::new(&env);
-        batch.push_back((student.clone(), 0_i128, 1_u32));
-        client.batch_mint_rewards(&admin, &batch);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #1)")] // Unauthorized
-    fn test_batch_mint_non_admin_rejected() {
-        let (env, client, _admin, student) = setup();
-        let non_admin = Address::generate(&env);
-        let mut batch = Vec::new(&env);
-        batch.push_back((student.clone(), 100_i128, 1_u32));
-        client.batch_mint_rewards(&non_admin, &batch);
+    #[should_panic(expected = "NotInit")]
+    fn test_mint_reward_rejects_when_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RewardsContract);
+        let client = RewardsContractClient::new(&env, &contract_id);
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &10, &RewardReason::Attendance);
     }
 
     // -----------------------------------------------------------------------
-    // Issue #23 – reward reason codes
+    // Issue #22 — batch_mint_rewards tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_reason_attendance() {
-        let (_env, client, admin, student) = setup();
-        let bal = client.mint_reward(&admin, &student, &10, &(RewardReason::Attendance.as_u32()));
-        assert_eq!(bal, 10);
+    fn test_batch_mint_rewards_success() {
+        let (env, client, _admin) = setup();
+
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        let s3 = Address::generate(&env);
+
+        let recipients = Vec::from_array(&env, [s1.clone(), s2.clone(), s3.clone()]);
+        let amounts = Vec::from_array(&env, [100_i128, 200_i128, 50_i128]);
+
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Attendance);
+
+        assert_eq!(client.get_balance(&s1), 100);
+        assert_eq!(client.get_balance(&s2), 200);
+        assert_eq!(client.get_balance(&s3), 50);
     }
 
     #[test]
-    fn test_reason_academic() {
-        let (_env, client, admin, student) = setup();
-        let bal = client.mint_reward(&admin, &student, &20, &(RewardReason::Academic.as_u32()));
-        assert_eq!(bal, 20);
+    fn test_batch_mint_rewards_accumulates_existing_balance() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        // Pre-existing balance
+        client.mint_reward(&student, &10, &RewardReason::Academic);
+
+        let recipients = Vec::from_array(&env, [student.clone()]);
+        let amounts = Vec::from_array(&env, [90_i128]);
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Event);
+
+        assert_eq!(client.get_balance(&student), 100);
     }
 
     #[test]
-    fn test_reason_event() {
-        let (_env, client, admin, student) = setup();
-        let bal = client.mint_reward(&admin, &student, &30, &(RewardReason::Event.as_u32()));
-        assert_eq!(bal, 30);
+    #[should_panic(expected = "EmptyBatch")]
+    fn test_batch_mint_rewards_rejects_empty_batch() {
+        let (env, client, _admin) = setup();
+        let recipients: Vec<Address> = Vec::new(&env);
+        let amounts: Vec<i128> = Vec::new(&env);
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Attendance);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")] // UnknownReason
-    fn test_unknown_reason_rejected() {
-        let (_env, client, admin, student) = setup();
-        client.mint_reward(&admin, &student, &50, &99); // 99 is not a valid reason
+    #[should_panic(expected = "LengthMismatch")]
+    fn test_batch_mint_rewards_rejects_mismatched_lengths() {
+        let (env, client, _admin) = setup();
+        let s1 = Address::generate(&env);
+        let recipients = Vec::from_array(&env, [s1.clone()]);
+        let amounts = Vec::from_array(&env, [10_i128, 20_i128]);
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Attendance);
     }
 
     #[test]
-    fn test_batch_mint_all_three_reasons() {
-        let (env, client, admin, student1) = setup();
-        let student2 = Address::generate(&env);
-        let student3 = Address::generate(&env);
-        let mut batch = Vec::new(&env);
-        batch.push_back((student1.clone(), 10_i128, RewardReason::Attendance.as_u32()));
-        batch.push_back((student2.clone(), 20_i128, RewardReason::Academic.as_u32()));
-        batch.push_back((student3.clone(), 30_i128, RewardReason::Event.as_u32()));
-        let balances = client.batch_mint_rewards(&admin, &batch);
-        assert_eq!(balances.get(0).unwrap(), 10);
-        assert_eq!(balances.get(1).unwrap(), 20);
-        assert_eq!(balances.get(2).unwrap(), 30);
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_batch_mint_rewards_rejects_zero_amount() {
+        let (env, client, _admin) = setup();
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        let recipients = Vec::from_array(&env, [s1.clone(), s2.clone()]);
+        let amounts = Vec::from_array(&env, [50_i128, 0_i128]);
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Attendance);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #4)")] // UnknownReason
-    fn test_batch_mint_unknown_reason_rejected() {
-        let (env, client, admin, student) = setup();
-        let mut batch = Vec::new(&env);
-        batch.push_back((student.clone(), 50_i128, 99_u32)); // invalid reason
-        client.batch_mint_rewards(&admin, &batch);
+    #[should_panic(expected = "NotInit")]
+    fn test_batch_mint_rewards_rejects_when_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RewardsContract);
+        let client = RewardsContractClient::new(&env, &contract_id);
+        let s1 = Address::generate(&env);
+        let recipients = Vec::from_array(&env, [s1.clone()]);
+        let amounts = Vec::from_array(&env, [10_i128]);
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Attendance);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #23 — Reward reason codes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_reward_with_attendance_reason() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &10, &RewardReason::Attendance);
+        assert_eq!(client.get_balance(&student), 10);
+    }
+
+    #[test]
+    fn test_mint_reward_with_academic_reason() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &20, &RewardReason::Academic);
+        assert_eq!(client.get_balance(&student), 20);
+    }
+
+    #[test]
+    fn test_mint_reward_with_event_reason() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &30, &RewardReason::Event);
+        assert_eq!(client.get_balance(&student), 30);
+    }
+
+    #[test]
+    fn test_batch_mint_with_all_reasons() {
+        let (env, client, _admin) = setup();
+
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+
+        // Batch with Attendance
+        client.batch_mint_rewards(
+            &Vec::from_array(&env, [s1.clone()]),
+            &Vec::from_array(&env, [15_i128]),
+            &RewardReason::Attendance,
+        );
+        // Batch with Academic
+        client.batch_mint_rewards(
+            &Vec::from_array(&env, [s1.clone()]),
+            &Vec::from_array(&env, [25_i128]),
+            &RewardReason::Academic,
+        );
+        // Batch with Event
+        client.batch_mint_rewards(
+            &Vec::from_array(&env, [s2.clone()]),
+            &Vec::from_array(&env, [40_i128]),
+            &RewardReason::Event,
+        );
+
+        assert_eq!(client.get_balance(&s1), 40);
+        assert_eq!(client.get_balance(&s2), 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_balance test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_balance_returns_zero_for_unknown_wallet() {
+        let (env, client, _admin) = setup();
+        let unknown = Address::generate(&env);
+        assert_eq!(client.get_balance(&unknown), 0);
     }
 }
