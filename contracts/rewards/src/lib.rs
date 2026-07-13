@@ -4,56 +4,92 @@
 //! and academic performance thresholds.
 //!
 //! ## Responsibilities
-//! - Initialize the contract with an admin address (one-time only)
-//! - Mint reward points to individual student wallets (admin-only)
-//! - Batch-mint reward points to multiple students in one transaction
-//! - Record the reason a reward was issued (attendance, academic, event)
+//! - Admin-only minting of reward points to student wallets (issue #21)
+//! - Batch minting to multiple students in one operation (issue #22)
+//! - Reason codes for why a reward was issued (issue #23)
 //! - Emit reward events for off-chain indexing
-//!
-//! ## Storage Keys
-//! - `DataKey::Initialized`     — `bool`    — one-time init guard
-//! - `DataKey::Admin`           — `Address` — contract administrator
-//! - `DataKey::Balance(wallet)` — `i128`    — reward point balance per student
+//! - Evaluate eligibility criteria (attendance %, grade thresholds)
 
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    Address, Env, Vec,
+    contract, contractimpl, contracterror, contracttype, panic_with_error,
+    symbol_short, Address, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
-// Storage key enum
+// Error codes
 // ---------------------------------------------------------------------------
 
-/// All persistent storage keys used by this contract.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// Whether `initialize` has already been called.
-    Initialized,
-    /// The admin address set during initialization.
-    Admin,
-    /// Reward point balance for a given student wallet.
-    Balance(Address),
+/// Contract error codes returned when validation or authorization fails.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RewardError {
+    /// Caller is not the stored admin.
+    Unauthorized = 1,
+    /// Mint amount must be greater than zero.
+    ZeroAmount = 2,
+    /// Batch list must not be empty.
+    EmptyBatch = 3,
+    /// Provided reason code is not recognised.
+    UnknownReason = 4,
 }
 
 // ---------------------------------------------------------------------------
-// Reward reason codes  (Issue #23)
+// Reward reason codes (issue #23)
 // ---------------------------------------------------------------------------
 
-/// The reason a reward was issued to a student.
+/// Supported reasons for issuing a reward.
 ///
-/// All mint functions require a valid `RewardReason`. Unknown or out-of-range
-/// reason values will cause a panic with `"InvalidReason"`.
+/// - `Attendance` – student met attendance requirements.
+/// - `Academic`   – student achieved grade/performance threshold.
+/// - `Event`      – student participated in a sponsored event.
+///
+/// Any value outside these three is rejected with [`RewardError::UnknownReason`].
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RewardReason {
-    /// Reward issued for meeting attendance requirements.
     Attendance,
-    /// Reward issued for academic performance (grades, test scores, etc.).
     Academic,
-    /// Reward issued for participation in a sponsored event or program.
     Event,
+}
+
+impl RewardReason {
+    /// Parse a raw `u32` value into a [`RewardReason`].
+    ///
+    /// Uses the same numeric mapping as the public API:
+    /// - `1` → `Attendance`
+    /// - `2` → `Academic`
+    /// - `3` → `Event`
+    /// - anything else → `None`
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(Self::Attendance),
+            2 => Some(Self::Academic),
+            3 => Some(Self::Event),
+            _ => None,
+        }
+    }
+
+    /// Numeric identifier used in events and external APIs.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::Attendance => 1,
+            Self::Academic => 2,
+            Self::Event => 3,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+pub enum DataKey {
+    /// Stores the admin [`Address`] set during `initialize`.
+    Admin,
+    /// Stores the reward point balance for a given student [`Address`].
+    Balance(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +267,36 @@ impl RewardsContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("NotInit"));
         admin.require_auth();
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    /// Panic with [`RewardError::Unauthorized`] if `caller` is not the stored admin.
+    fn assert_admin(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, RewardError::Unauthorized));
+        if admin != *caller {
+            panic_with_error!(env, RewardError::Unauthorized);
+        }
+    }
+
+    /// Add `amount` to `student`'s balance and return the new total.
+    fn add_balance(env: &Env, student: &Address, amount: i128) -> i128 {
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Balance(student.clone()))
+            .unwrap_or(0);
+        let new_balance = current + amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance(student.clone()), &new_balance);
+        new_balance
     }
 }
 
