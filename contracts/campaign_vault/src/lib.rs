@@ -27,6 +27,8 @@ pub enum DataKey {
     Campaign(u32),
     /// Tracks the total funded reward pool for a campaign ID.
     Pool(u32),
+    /// Tracks the total allocation contributed by a sponsor for a campaign.
+    Funding((u32, Address)),
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +191,90 @@ impl CampaignVaultContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #30 — Sponsor funding
+    // -----------------------------------------------------------------------
+
+    /// Record a sponsor funding contribution toward a campaign.
+    ///
+    /// Only the contract admin may record funding. The funding amount must be
+    /// greater than zero and the campaign must exist and be `Active`.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Target campaign ID.
+    /// * `sponsor`     — Sponsor [`Address`] making the contribution.
+    /// * `amount`      — Funding amount (must be > 0).
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"UnknownCampaign"` if the campaign does not exist.
+    /// - `"CampaignClosed"` if the campaign is not `Active`.
+    /// - `"ZeroAmount"` if `amount` is zero or negative.
+    pub fn fund_campaign(env: Env, campaign_id: u32, sponsor: Address, amount: i128) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if amount <= 0 {
+            panic!("ZeroAmount");
+        }
+
+        let campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .unwrap_or_else(|| panic!("UnknownCampaign"));
+
+        if campaign.status != CampaignStatus::Active {
+            panic!("CampaignClosed");
+        }
+
+        // Increase the campaign's funded reward pool
+        let pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(campaign_id))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(campaign_id), &(pool + amount));
+
+        // Track this sponsor's cumulative allocation
+        let contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Funding((campaign_id, sponsor.clone())))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::Funding((campaign_id, sponsor.clone())),
+            &(contributed + amount),
+        );
+
+        // Emit funding event for off-chain indexing
+        env.events()
+            .publish((symbol_short!("fund"),), (sponsor, campaign_id, amount));
+    }
+
+    /// Return the total funded reward pool for `campaign_id`.
+    ///
+    /// Returns `0` if the campaign has never been funded.
+    pub fn get_pool(env: Env, campaign_id: u32) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Pool(campaign_id))
+            .unwrap_or(0)
+    }
+
+    /// Return the cumulative allocation contributed by `sponsor` for `campaign_id`.
+    ///
+    /// Returns `0` if the sponsor has never contributed.
+    pub fn get_funding(env: Env, campaign_id: u32, sponsor: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Funding((campaign_id, sponsor)))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -217,8 +303,8 @@ mod test {
     use super::*;
     use soroban_sdk::{
         symbol_short,
-        testutils::{Address as _, MockAuth, MockAuthInvoke},
-        Address, Env, IntoVal, Symbol,
+        testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+        Address, Env, IntoVal, Symbol, TryIntoVal, Val, Vec,
     };
 
     /// Set up a fresh initialized contract and return (env, client, admin).
@@ -471,5 +557,214 @@ mod test {
                 &200u64,
             );
         assert_eq!(result.unwrap().unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #30 — fund_campaign tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fund_campaign_increases_pool_and_records_allocation() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.fund_campaign(&id, &sponsor, &500);
+        assert_eq!(client.get_pool(&id), 500);
+        assert_eq!(client.get_funding(&id, &sponsor), 500);
+
+        // Subsequent contributions accumulate
+        client.fund_campaign(&id, &sponsor, &250);
+        assert_eq!(client.get_pool(&id), 750);
+        assert_eq!(client.get_funding(&id, &sponsor), 750);
+
+        let _ = env;
+    }
+
+    #[test]
+    fn test_fund_campaign_tracks_allocations_per_sponsor() {
+        let (env, client, _admin) = setup();
+        let sponsor_a = Address::generate(&env);
+        let sponsor_b = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor_a,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.fund_campaign(&id, &sponsor_a, &300);
+        client.fund_campaign(&id, &sponsor_b, &700);
+
+        assert_eq!(client.get_pool(&id), 1_000);
+        assert_eq!(client.get_funding(&id, &sponsor_a), 300);
+        assert_eq!(client.get_funding(&id, &sponsor_b), 700);
+    }
+
+    #[test]
+    fn test_fund_campaign_emits_event() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.fund_campaign(&id, &sponsor, &500);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_contract_id, topics, data) = events.get(0).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("fund"));
+
+        let vals: Vec<Val> = data.try_into_val(&env).unwrap();
+        assert_eq!(vals.len(), 3);
+        let emitted_sponsor: Address = vals.get(0).unwrap().try_into_val(&env).unwrap();
+        let emitted_campaign: u32 = vals.get(1).unwrap().try_into_val(&env).unwrap();
+        let emitted_amount: i128 = vals.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(emitted_sponsor, sponsor);
+        assert_eq!(emitted_campaign, id);
+        assert_eq!(emitted_amount, 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_fund_campaign_rejects_zero_amount() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnknownCampaign")]
+    fn test_fund_campaign_rejects_unknown_campaign() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        client.fund_campaign(&99, &sponsor, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "CampaignClosed")]
+    fn test_fund_campaign_rejects_closed_campaign() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        // Force the campaign into the Closed state via direct storage access
+        env.as_contract(&contract_id, || {
+            let mut campaign: Campaign = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Campaign(id))
+                .unwrap();
+            campaign.status = CampaignStatus::Closed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Campaign(id), &campaign);
+        });
+
+        client.fund_campaign(&id, &sponsor, &100);
+    }
+
+    #[test]
+    fn test_fund_campaign_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_campaign",
+                    args: (
+                        symbol_short!("math"),
+                        sponsor.clone(),
+                        1_000_i128,
+                        symbol_short!("gpa30"),
+                        100u64,
+                        200u64,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_campaign(
+                &symbol_short!("math"),
+                &sponsor,
+                &1_000_i128,
+                &symbol_short!("gpa30"),
+                &100u64,
+                &200u64,
+            )
+            .unwrap()
+            .unwrap();
+
+        // Authorize only a non-admin attacker for `fund_campaign` — the admin's
+        // authorization is missing, so the call must fail.
+        let attacker = Address::generate(&env);
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "fund_campaign",
+                    args: (id, sponsor.clone(), 100_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_fund_campaign(&id, &sponsor, &100_i128);
+        assert!(result.is_err());
     }
 }
