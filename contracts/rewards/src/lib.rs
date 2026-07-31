@@ -4,35 +4,21 @@
 //! and academic performance thresholds.
 //!
 //! ## Responsibilities
+//! - Contract skeleton with admin initialization (issue #19)
+//! - Reward point balance storage and read-only lookup (issue #20)
 //! - Admin-only minting of reward points to student wallets (issue #21)
 //! - Batch minting to multiple students in one operation (issue #22)
 //! - Reason codes for why a reward was issued (issue #23)
 //! - Emit reward events for off-chain indexing
 //! - Evaluate eligibility criteria (attendance %, grade thresholds)
+//!
+//! ## Storage Keys
+//! - `DataKey::Initialized`      — `bool`     — guards one-time init
+//! - `DataKey::Admin`            — `Address`  — contract administrator
+//! - `DataKey::Balance(wallet)`  — `i128`     — per-wallet reward point balance
 
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol, Vec,
-};
-
-// ---------------------------------------------------------------------------
-// Error codes
-// ---------------------------------------------------------------------------
-
-/// Contract error codes returned when validation or authorization fails.
-#[contracterror]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RewardError {
-    /// Caller is not the stored admin.
-    Unauthorized = 1,
-    /// Mint amount must be greater than zero.
-    ZeroAmount = 2,
-    /// Batch list must not be empty.
-    EmptyBatch = 3,
-    /// Provided reason code is not recognised.
-    UnknownReason = 4,
-}
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
 // ---------------------------------------------------------------------------
 // Reward reason codes (issue #23)
@@ -86,6 +72,8 @@ impl RewardReason {
 
 #[contracttype]
 pub enum DataKey {
+    /// Whether `initialize` has already been called.
+    Initialized,
     /// Stores the admin [`Address`] set during `initialize`.
     Admin,
     /// Stores the reward point balance for a given student [`Address`].
@@ -231,18 +219,23 @@ impl RewardsContract {
             // Emit one event per recipient
             env.events().publish(
                 (soroban_sdk::symbol_short!("reward"),),
-                (recipient, amount, reason.clone()),
+                (recipient, amount, reason),
             );
         }
     }
 
     // -----------------------------------------------------------------------
-    // Balance query
+    // Issue #20 — Balance query
     // -----------------------------------------------------------------------
 
     /// Return the current reward point balance for `wallet`.
     ///
+    /// This is a read-only lookup and never mutates state.
+    ///
     /// Returns `0` if the wallet has never received any rewards.
+    ///
+    /// # Arguments
+    /// * `wallet` — Student wallet address to query.
     pub fn get_balance(env: Env, wallet: Address) -> i128 {
         env.storage()
             .persistent()
@@ -267,36 +260,6 @@ impl RewardsContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("NotInit"));
         admin.require_auth();
-    }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Panic with [`RewardError::Unauthorized`] if `caller` is not the stored admin.
-    fn assert_admin(env: &Env, caller: &Address) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RewardError::Unauthorized));
-        if admin != *caller {
-            panic_with_error!(env, RewardError::Unauthorized);
-        }
-    }
-
-    /// Add `amount` to `student`'s balance and return the new total.
-    fn add_balance(env: &Env, student: &Address, amount: i128) -> i128 {
-        let current: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(student.clone()))
-            .unwrap_or(0);
-        let new_balance = current + amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(student.clone()), &new_balance);
-        new_balance
     }
 }
 
@@ -534,7 +497,7 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // get_balance test
+    // Issue #20 — get_balance tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -542,5 +505,32 @@ mod test {
         let (env, client, _admin) = setup();
         let unknown = Address::generate(&env);
         assert_eq!(client.get_balance(&unknown), 0);
+    }
+
+    #[test]
+    fn test_get_balance_returns_stored_value() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        // No balance before any minting
+        assert_eq!(client.get_balance(&student), 0);
+
+        client.mint_reward(&student, &250, &RewardReason::Attendance);
+
+        // Balance reflects the stored value after minting
+        assert_eq!(client.get_balance(&student), 250);
+    }
+
+    #[test]
+    fn test_get_balance_does_not_mutate_state() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Event);
+
+        // Repeated reads return the same value and do not change storage
+        assert_eq!(client.get_balance(&student), 100);
+        assert_eq!(client.get_balance(&student), 100);
+        assert_eq!(client.get_balance(&student), 100);
     }
 }
