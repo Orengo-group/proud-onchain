@@ -11,10 +11,7 @@
 //! - Evaluate eligibility criteria (attendance %, grade thresholds)
 
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, panic_with_error,
-    symbol_short, Address, Env, Symbol, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
 
 // ---------------------------------------------------------------------------
 // Error codes
@@ -86,6 +83,8 @@ impl RewardReason {
 
 #[contracttype]
 pub enum DataKey {
+    /// Whether `initialize` has already been called.
+    Initialized,
     /// Stores the admin [`Address`] set during `initialize`.
     Admin,
     /// Stores the reward point balance for a given student [`Address`].
@@ -231,7 +230,7 @@ impl RewardsContract {
             // Emit one event per recipient
             env.events().publish(
                 (soroban_sdk::symbol_short!("reward"),),
-                (recipient, amount, reason.clone()),
+                (recipient, amount, reason),
             );
         }
     }
@@ -268,36 +267,6 @@ impl RewardsContract {
             .unwrap_or_else(|| panic!("NotInit"));
         admin.require_auth();
     }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Panic with [`RewardError::Unauthorized`] if `caller` is not the stored admin.
-    fn assert_admin(env: &Env, caller: &Address) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RewardError::Unauthorized));
-        if admin != *caller {
-            panic_with_error!(env, RewardError::Unauthorized);
-        }
-    }
-
-    /// Add `amount` to `student`'s balance and return the new total.
-    fn add_balance(env: &Env, student: &Address, amount: i128) -> i128 {
-        let current: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(student.clone()))
-            .unwrap_or(0);
-        let new_balance = current + amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(student.clone()), &new_balance);
-        new_balance
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +276,11 @@ impl RewardsContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events as _},
+        Address, Env, Symbol, TryIntoVal, Val, Vec,
+    };
 
     /// Set up a fresh initialized contract and return (env, client, admin).
     fn setup() -> (Env, RewardsContractClient<'static>, Address) {
@@ -542,5 +515,71 @@ mod test {
         let (env, client, _admin) = setup();
         let unknown = Address::generate(&env);
         assert_eq!(client.get_balance(&unknown), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #24 — Event emission tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_reward_emits_event() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_contract_id, topics, data) = events.get(0).unwrap();
+
+        // Topic: single "reward" symbol
+        assert_eq!(topics.len(), 1);
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("reward"));
+
+        // Data: (recipient, amount, reason)
+        let vals: Vec<Val> = data.try_into_val(&env).unwrap();
+        assert_eq!(vals.len(), 3);
+        let recipient: Address = vals.get(0).unwrap().try_into_val(&env).unwrap();
+        let amount: i128 = vals.get(1).unwrap().try_into_val(&env).unwrap();
+        let reason: RewardReason = vals.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(recipient, student);
+        assert_eq!(amount, 100);
+        assert_eq!(reason, RewardReason::Attendance);
+    }
+
+    #[test]
+    fn test_batch_mint_emits_event_per_recipient() {
+        let (env, client, _admin) = setup();
+
+        let s1 = Address::generate(&env);
+        let s2 = Address::generate(&env);
+        let recipients = Vec::from_array(&env, [s1.clone(), s2.clone()]);
+        let amounts = Vec::from_array(&env, [50_i128, 75_i128]);
+
+        client.batch_mint_rewards(&recipients, &amounts, &RewardReason::Academic);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+
+        let expected_recipients = Vec::from_array(&env, [s1, s2]);
+        let expected_amounts = Vec::from_array(&env, [50_i128, 75_i128]);
+
+        for i in 0..2 {
+            let (_contract_id, topics, data) = events.get(i).unwrap();
+            assert_eq!(topics.len(), 1);
+            let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            assert_eq!(topic, symbol_short!("reward"));
+
+            let vals: Vec<Val> = data.try_into_val(&env).unwrap();
+            assert_eq!(vals.len(), 3);
+            let recipient: Address = vals.get(0).unwrap().try_into_val(&env).unwrap();
+            let amount: i128 = vals.get(1).unwrap().try_into_val(&env).unwrap();
+            let reason: RewardReason = vals.get(2).unwrap().try_into_val(&env).unwrap();
+            assert_eq!(reason, RewardReason::Academic);
+            assert!(expected_recipients.contains(&recipient));
+            assert!(expected_amounts.contains(amount));
+        }
     }
 }
