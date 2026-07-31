@@ -4,11 +4,12 @@
 //!
 //! ## Responsibilities
 //! - Initialize the contract with an admin address (one-time only)
-//! - Register a student identity linked to a hashed NFC UID and Stellar wallet
+//! - Register a student identity linked to a hashed NFC UID and Stellar wallet (#17)
 //! - Reject duplicate student IDs, NFC hashes, and wallet addresses
 //! - Lookup student by student ID (#13) or by NFC hash (#14)
-//! - Update a student's wallet address with admin authorization (#15)
-//! - Deactivate and reactivate student records without data loss (#16)
+//! - Update a student's wallet address with admin authorization (#15, #17)
+//! - Deactivate and reactivate student records without data loss (#16, #17)
+//! - Restrict all write operations to the admin set at initialization (#17)
 //!
 //! ## Storage Keys
 //! - `DataKey::Initialized`            — `bool`  — guards one-time init
@@ -18,10 +19,7 @@
 //! - `DataKey::WalletIndex(wallet)`    — `BytesN<32>` (student_id) — reverse index
 
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    Address, BytesN, Env,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 
 // ---------------------------------------------------------------------------
 // Storage key enum
@@ -95,13 +93,21 @@ impl IdentityRegistryContract {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #12 — Student registration with duplicate checks
+    // Issue #12 — Student registration with duplicate checks (#17: admin only)
     // -----------------------------------------------------------------------
 
     /// Register a new student identity.
     ///
-    /// Validates that the `student_id`, `nfc_hash`, and `wallet` are all unique
-    /// before storing the record. The record's `active` field is set to `true`.
+    /// Only the contract admin may register students. Validates that the
+    /// `student_id`, `nfc_hash`, and `wallet` are all unique before storing the
+    /// record. The record's `active` field is set to `true`.
+    ///
+    /// Panics:
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"DuplicateStudentId"` if the student ID is already registered.
+    /// - `"DuplicateNfcHash"` if the NFC hash is already registered.
+    /// - `"DuplicateWallet"` if the wallet is already registered.
     pub fn register_student(
         env: Env,
         student_id: BytesN<32>,
@@ -111,13 +117,34 @@ impl IdentityRegistryContract {
         if !env.storage().instance().has(&DataKey::Initialized) {
             panic!("NotInit");
         }
-        if env.storage().persistent().has(&DataKey::Student(student_id.clone())) {
+
+        // Only admin may register students (#17)
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"));
+        admin.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Student(student_id.clone()))
+        {
             panic!("DuplicateStudentId");
         }
-        if env.storage().persistent().has(&DataKey::NfcIndex(nfc_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::NfcIndex(nfc_hash.clone()))
+        {
             panic!("DuplicateNfcHash");
         }
-        if env.storage().persistent().has(&DataKey::WalletIndex(wallet.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::WalletIndex(wallet.clone()))
+        {
             panic!("DuplicateWallet");
         }
 
@@ -127,9 +154,15 @@ impl IdentityRegistryContract {
             wallet: wallet.clone(),
             active: true,
         };
-        env.storage().persistent().set(&DataKey::Student(student_id.clone()), &record);
-        env.storage().persistent().set(&DataKey::NfcIndex(nfc_hash), &student_id);
-        env.storage().persistent().set(&DataKey::WalletIndex(wallet), &student_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Student(student_id.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NfcIndex(nfc_hash), &student_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WalletIndex(wallet), &student_id);
     }
 
     // -----------------------------------------------------------------------
@@ -159,10 +192,8 @@ impl IdentityRegistryContract {
     /// Returns `Some(StudentRecord)` if the hash resolves to a student,
     /// or `None` if the hash is unknown.
     pub fn get_student_by_nfc_hash(env: Env, nfc_hash: BytesN<32>) -> Option<StudentRecord> {
-        let student_id: Option<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NfcIndex(nfc_hash));
+        let student_id: Option<BytesN<32>> =
+            env.storage().persistent().get(&DataKey::NfcIndex(nfc_hash));
 
         match student_id {
             None => None,
@@ -185,11 +216,7 @@ impl IdentityRegistryContract {
     /// - `"Unauthorized"` if the caller is not the admin.
     /// - `"StudentNotFound"` if no student with that ID exists.
     /// - `"DuplicateWallet"` if the new wallet is already in use.
-    pub fn update_student_wallet(
-        env: Env,
-        student_id: BytesN<32>,
-        new_wallet: Address,
-    ) {
+    pub fn update_student_wallet(env: Env, student_id: BytesN<32>, new_wallet: Address) {
         if !env.storage().instance().has(&DataKey::Initialized) {
             panic!("NotInit");
         }
@@ -210,7 +237,11 @@ impl IdentityRegistryContract {
             .unwrap_or_else(|| panic!("StudentNotFound"));
 
         // New wallet must not belong to another student
-        if env.storage().persistent().has(&DataKey::WalletIndex(new_wallet.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::WalletIndex(new_wallet.clone()))
+        {
             panic!("DuplicateWallet");
         }
 
@@ -308,7 +339,10 @@ impl IdentityRegistryContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        Address, BytesN, Env, IntoVal,
+    };
 
     /// Helper — build a BytesN<32> filled with a single byte value.
     fn make_id(env: &Env, val: u8) -> BytesN<32> {
@@ -423,6 +457,142 @@ mod test {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #17 — Admin authorization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_register_student_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, IdentityRegistryContract);
+        let client = IdentityRegistryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Authorize only the admin for `initialize`
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        // Authorize only a non-admin for `register_student` — the admin's
+        // authorization is missing, so the call must fail.
+        let student_id = make_id(&env, 0x77);
+        let nfc_hash = make_id(&env, 0x78);
+        let wallet = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_student",
+                    args: (student_id.clone(), nfc_hash.clone(), wallet.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .register_student(&student_id, &nfc_hash, &wallet);
+    }
+
+    #[test]
+    fn test_register_student_succeeds_as_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, IdentityRegistryContract);
+        let client = IdentityRegistryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        let student_id = make_id(&env, 0x66);
+        let nfc_hash = make_id(&env, 0x67);
+        let wallet = Address::generate(&env);
+
+        // Authorize the admin for `initialize`, then for `register_student`
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_student",
+                    args: (student_id.clone(), nfc_hash.clone(), wallet.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .register_student(&student_id, &nfc_hash, &wallet);
+
+        let record = client.get_student(&student_id).unwrap();
+        assert_eq!(record.wallet, wallet);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_update_wallet_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, IdentityRegistryContract);
+        let client = IdentityRegistryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Authorize the admin for `initialize` and `register_student`
+        let student_id = make_id(&env, 0x68);
+        let nfc_hash = make_id(&env, 0x69);
+        let wallet = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "register_student",
+                    args: (student_id.clone(), nfc_hash.clone(), wallet.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .register_student(&student_id, &nfc_hash, &wallet);
+
+        // Attempt a wallet update authorized by a non-admin — must fail
+        let new_wallet = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_student_wallet",
+                    args: (student_id.clone(), new_wallet.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_student_wallet(&student_id, &new_wallet);
+    }
+
     #[test]
     fn test_multiple_students_can_be_registered() {
         let env = Env::default();
@@ -514,7 +684,9 @@ mod test {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        assert!(client.get_student_by_nfc_hash(&make_id(&env, 0x99)).is_none());
+        assert!(client
+            .get_student_by_nfc_hash(&make_id(&env, 0x99))
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
