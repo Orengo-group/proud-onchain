@@ -262,6 +262,51 @@ impl RewardsContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #25 — Reward redemption (burn)
+    // -----------------------------------------------------------------------
+
+    /// Burn reward points from a student's balance as part of a redemption.
+    ///
+    /// Only the contract admin may call this function. The burn amount must be
+    /// greater than zero and cannot exceed the student's current balance.
+    ///
+    /// # Arguments
+    /// * `wallet` — Student wallet whose balance is reduced.
+    /// * `amount` — Number of reward points to burn (must be > 0).
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"ZeroAmount"` if `amount` is zero or negative.
+    /// - `"InsufficientBalance"` if `amount` exceeds the wallet's balance.
+    pub fn redeem_rewards(env: Env, wallet: Address, amount: i128) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if amount <= 0 {
+            panic!("ZeroAmount");
+        }
+
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(wallet.clone()))
+            .unwrap_or(0);
+
+        if amount > current {
+            panic!("InsufficientBalance");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(wallet.clone()), &(current - amount));
+
+        // Emit redemption event for off-chain indexing
+        env.events()
+            .publish((soroban_sdk::symbol_short!("redeem"),), (wallet, amount));
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -290,8 +335,8 @@ mod test {
     use super::*;
     use soroban_sdk::{
         symbol_short,
-        testutils::{Address as _, Events as _},
-        Address, Env, Symbol, TryIntoVal, Val, Vec,
+        testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+        Address, Env, IntoVal, Symbol, TryIntoVal, Val, Vec,
     };
 
     /// Set up a fresh initialized contract and return (env, client, admin).
@@ -618,5 +663,140 @@ mod test {
         assert_eq!(client.get_balance(&student), 100);
         assert_eq!(client.get_balance(&student), 100);
         assert_eq!(client.get_balance(&student), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #25 — redeem_rewards tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_redeem_rewards_decreases_balance() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        assert_eq!(client.get_balance(&student), 100);
+
+        client.redeem_rewards(&student, &40);
+        assert_eq!(client.get_balance(&student), 60);
+    }
+
+    #[test]
+    fn test_redeem_rewards_can_burn_full_balance() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &75, &RewardReason::Event);
+        client.redeem_rewards(&student, &75);
+        assert_eq!(client.get_balance(&student), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientBalance")]
+    fn test_redeem_rewards_rejects_insufficient_balance() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        client.redeem_rewards(&student, &150);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientBalance")]
+    fn test_redeem_rewards_rejects_unknown_wallet() {
+        let (env, client, _admin) = setup();
+        let unknown = Address::generate(&env);
+        client.redeem_rewards(&unknown, &10);
+    }
+
+    #[test]
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_redeem_rewards_rejects_zero_amount() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        client.redeem_rewards(&student, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_redeem_rewards_rejects_negative_amount() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        client.redeem_rewards(&student, &-5);
+    }
+
+    #[test]
+    fn test_redeem_rewards_emits_event() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Attendance);
+        client.redeem_rewards(&student, &40);
+
+        // Two events: one reward, one redeem
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+
+        let (_contract_id, topics, data) = events.get(1).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("redeem"));
+
+        let vals: Vec<Val> = data.try_into_val(&env).unwrap();
+        assert_eq!(vals.len(), 2);
+        let wallet: Address = vals.get(0).unwrap().try_into_val(&env).unwrap();
+        let amount: i128 = vals.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(wallet, student);
+        assert_eq!(amount, 40);
+    }
+
+    #[test]
+    fn test_redeem_rewards_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, RewardsContract);
+        let client = RewardsContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let student = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "mint_reward",
+                    args: (student.clone(), 100_i128, RewardReason::Attendance).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .mint_reward(&student, &100, &RewardReason::Attendance);
+
+        // Authorize only a non-admin attacker for `redeem_rewards` — the admin's
+        // authorization is missing, so the call must fail.
+        let attacker = Address::generate(&env);
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "redeem_rewards",
+                    args: (student.clone(), 40_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_redeem_rewards(&student, &40_i128);
+        assert!(result.is_err());
     }
 }
