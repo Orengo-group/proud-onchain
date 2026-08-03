@@ -4,11 +4,18 @@
 //! and academic performance thresholds.
 //!
 //! ## Responsibilities
+//! - Contract skeleton with admin initialization (issue #19)
+//! - Reward point balance storage and read-only lookup (issue #20)
 //! - Admin-only minting of reward points to student wallets (issue #21)
 //! - Batch minting to multiple students in one operation (issue #22)
 //! - Reason codes for why a reward was issued (issue #23)
 //! - Emit reward events for off-chain indexing
 //! - Evaluate eligibility criteria (attendance %, grade thresholds)
+//!
+//! ## Storage Keys
+//! - `DataKey::Initialized`      — `bool`     — guards one-time init
+//! - `DataKey::Admin`            — `Address`  — contract administrator
+//! - `DataKey::Balance(wallet)`  — `i128`     — per-wallet reward point balance
 
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
@@ -236,12 +243,17 @@ impl RewardsContract {
     }
 
     // -----------------------------------------------------------------------
-    // Balance query
+    // Issue #20 — Balance query
     // -----------------------------------------------------------------------
 
     /// Return the current reward point balance for `wallet`.
     ///
+    /// This is a read-only lookup and never mutates state.
+    ///
     /// Returns `0` if the wallet has never received any rewards.
+    ///
+    /// # Arguments
+    /// * `wallet` — Student wallet address to query.
     pub fn get_balance(env: Env, wallet: Address) -> i128 {
         env.storage()
             .persistent()
@@ -507,7 +519,7 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // get_balance test
+    // Issue #20 — get_balance tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -581,5 +593,30 @@ mod test {
             assert!(expected_recipients.contains(&recipient));
             assert!(expected_amounts.contains(amount));
         }
+    #[test]
+    fn test_get_balance_returns_stored_value() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        // No balance before any minting
+        assert_eq!(client.get_balance(&student), 0);
+
+        client.mint_reward(&student, &250, &RewardReason::Attendance);
+
+        // Balance reflects the stored value after minting
+        assert_eq!(client.get_balance(&student), 250);
+    }
+
+    #[test]
+    fn test_get_balance_does_not_mutate_state() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+
+        client.mint_reward(&student, &100, &RewardReason::Event);
+
+        // Repeated reads return the same value and do not change storage
+        assert_eq!(client.get_balance(&student), 100);
+        assert_eq!(client.get_balance(&student), 100);
+        assert_eq!(client.get_balance(&student), 100);
     }
 }
