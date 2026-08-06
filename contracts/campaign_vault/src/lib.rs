@@ -7,9 +7,24 @@
 //! - Release funds to the Rewards contract when criteria are met
 //! - Return unspent funds to sponsors after campaign expiry
 //! - Admin initialization and campaign storage types (issue #27)
+//! - Campaign lookup functions and ID index (issue #29)
+//! - Campaign lifecycle status management (issue #31)
+//! - Campaign reward allocation tracking (issue #32)
+//! - Campaign criteria reference handling (issue #33)
+//!
+//! ## Storage Keys
+//! - `DataKey::Initialized`     — `bool`    — guards one-time init
+//! - `DataKey::Admin`           — `Address` — contract administrator
+//! - `DataKey::CampaignCount`   — `u32`     — monotonic campaign ID counter
+//! - `DataKey::Campaign(id)`    — `Campaign` — campaign record keyed by ID
+//! - `DataKey::CampaignIds`     — `Vec<u32>` — index of all campaign IDs
+//! - `DataKey::Pool(id)`        — `i128`    — funded reward pool per campaign
+//! - `DataKey::Funding(id, addr)` — `i128`  — cumulative sponsor contribution
+//! - `DataKey::Allocated(id)`   — `i128`    — distributed reward total per campaign
+//! - `DataKey::RewardAllocation(id, addr)` — `i128` — per-student allocation
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -29,20 +44,30 @@ pub enum DataKey {
     Pool(u32),
     /// Tracks the total allocation contributed by a sponsor for a campaign.
     Funding((u32, Address)),
+    /// Index of all campaign IDs ever created.
+    CampaignIds,
+    /// Tracks the total reward amount distributed against a campaign.
+    Allocated(u32),
+    /// Tracks the reward amount allocated to a student for a campaign.
+    RewardAllocation((u32, Address)),
 }
 
 // ---------------------------------------------------------------------------
 // Campaign types
 // ---------------------------------------------------------------------------
 
-/// Lifecycle state of a sponsor campaign.
+/// Lifecycle state of a sponsor campaign (issue #31).
 #[contracttype]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CampaignStatus {
-    /// Campaign is open for funding.
+    /// Campaign has been created but is not yet accepting funding.
+    Draft,
+    /// Campaign is open for funding and reward distribution.
     Active,
-    /// Campaign is closed; no further funding is accepted.
-    Closed,
+    /// Campaign is temporarily on hold; no funding or rewards are processed.
+    Paused,
+    /// Campaign has finished; the lifecycle is terminal.
+    Completed,
     /// Campaign was cancelled; unspent funds return to the sponsor.
     Cancelled,
 }
@@ -151,6 +176,9 @@ impl CampaignVaultContract {
         if title == symbol_short!("") {
             panic!("EmptyTitle");
         }
+        if criteria_ref == symbol_short!("") {
+            panic!("EmptyCriteria");
+        }
         if reward_pool <= 0 {
             panic!("ZeroPool");
         }
@@ -165,6 +193,15 @@ impl CampaignVaultContract {
             .unwrap_or(0);
         let id = count + 1;
         env.storage().instance().set(&DataKey::CampaignCount, &id);
+
+        // Append the new ID to the campaign index (issue #29)
+        let mut ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CampaignIds)
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage().persistent().set(&DataKey::CampaignIds, &ids);
 
         let campaign = Campaign {
             id,
@@ -184,10 +221,22 @@ impl CampaignVaultContract {
     }
 
     /// Return the [`Campaign`] record for `campaign_id`, or `None` if unknown.
+    ///
+    /// Lookups never mutate contract state.
     pub fn get_campaign(env: Env, campaign_id: u32) -> Option<Campaign> {
         env.storage()
             .persistent()
             .get(&DataKey::Campaign(campaign_id))
+    }
+
+    /// Return the list of all campaign IDs created so far (issue #29).
+    ///
+    /// Returns an empty [`Vec`] if no campaigns have been created yet.
+    pub fn get_campaign_ids(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CampaignIds)
+            .unwrap_or(Vec::new(&env))
     }
 
     // -----------------------------------------------------------------------
@@ -275,6 +324,212 @@ impl CampaignVaultContract {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #31 — Campaign status management
+    // -----------------------------------------------------------------------
+
+    /// Update the lifecycle status of an existing campaign.
+    ///
+    /// Only the contract admin may update status. The requested transition
+    /// must be valid for the current state, otherwise the call panics.
+    ///
+    /// # Allowed transitions
+    /// - `Draft`     → `Active`, `Cancelled`
+    /// - `Active`    → `Paused`, `Completed`, `Cancelled`
+    /// - `Paused`    → `Active`, `Completed`, `Cancelled`
+    /// - `Completed` → (terminal)
+    /// - `Cancelled` → (terminal)
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Target campaign ID.
+    /// * `new_status`  — Desired lifecycle state.
+    ///
+    /// # Returns
+    /// The updated [`CampaignStatus`].
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"UnknownCampaign"` if the campaign does not exist.
+    /// - `"InvalidTransition"` if `new_status` is not reachable from the current status.
+    pub fn update_campaign_status(
+        env: Env,
+        campaign_id: u32,
+        new_status: CampaignStatus,
+    ) -> CampaignStatus {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        let mut campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .unwrap_or_else(|| panic!("UnknownCampaign"));
+
+        if !Self::can_transition(campaign.status, new_status) {
+            panic!("InvalidTransition");
+        }
+
+        campaign.status = new_status;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+
+        // Emit status event for off-chain indexing
+        env.events()
+            .publish((symbol_short!("status"),), (campaign_id, new_status));
+
+        new_status
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #32 — Reward allocation tracking
+    // -----------------------------------------------------------------------
+
+    /// Record a reward allocation against a campaign's funded pool.
+    ///
+    /// Only the contract admin (the authorized reward engine) may record
+    /// allocations. An allocation increases the campaign's distributed total
+    /// and can never exceed the available pool.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Target campaign ID.
+    /// * `student`     — Student [`Address`] receiving the reward.
+    /// * `amount`      — Allocation amount (must be > 0).
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"ZeroAmount"` if `amount` is zero or negative.
+    /// - `"UnknownCampaign"` if the campaign does not exist.
+    /// - `"CampaignClosed"` if the campaign is not `Active`.
+    /// - `"InsufficientPool"` if `amount` exceeds the remaining available pool.
+    pub fn record_campaign_reward(env: Env, campaign_id: u32, student: Address, amount: i128) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if amount <= 0 {
+            panic!("ZeroAmount");
+        }
+
+        let campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .unwrap_or_else(|| panic!("UnknownCampaign"));
+
+        if campaign.status != CampaignStatus::Active {
+            panic!("CampaignClosed");
+        }
+
+        // Prevent over-allocation against the remaining funded pool
+        let pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(campaign_id))
+            .unwrap_or(0);
+        let allocated: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocated(campaign_id))
+            .unwrap_or(0);
+        if amount > pool - allocated {
+            panic!("InsufficientPool");
+        }
+
+        // Increase the campaign's distributed total
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allocated(campaign_id), &(allocated + amount));
+
+        // Track per-student allocations
+        let student_allocated: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RewardAllocation((campaign_id, student.clone())))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::RewardAllocation((campaign_id, student.clone())),
+            &(student_allocated + amount),
+        );
+
+        // Emit allocation event for off-chain indexing
+        env.events()
+            .publish((symbol_short!("reward"),), (campaign_id, student, amount));
+    }
+
+    /// Return the total reward amount distributed against `campaign_id`.
+    ///
+    /// Returns `0` if nothing has been allocated yet.
+    pub fn get_allocated(env: Env, campaign_id: u32) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allocated(campaign_id))
+            .unwrap_or(0)
+    }
+
+    /// Return the reward amount allocated to `student` for `campaign_id`.
+    ///
+    /// Returns `0` if the student has no allocation.
+    pub fn get_student_allocation(env: Env, campaign_id: u32, student: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RewardAllocation((campaign_id, student)))
+            .unwrap_or(0)
+    }
+
+    /// Return the remaining pool available for allocation against `campaign_id`.
+    ///
+    /// Returns `0` if the campaign has never been funded.
+    pub fn get_available_pool(env: Env, campaign_id: u32) -> i128 {
+        let pool = Self::get_pool(env.clone(), campaign_id);
+        let allocated = Self::get_allocated(env, campaign_id);
+        pool - allocated
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #33 — Criteria reference handling
+    // -----------------------------------------------------------------------
+
+    /// Update the criteria reference of an existing campaign.
+    ///
+    /// Only the contract admin may update the reference, and only while the
+    /// campaign has not been finalized (`Completed` or `Cancelled`).
+    ///
+    /// # Arguments
+    /// * `campaign_id`  — Target campaign ID.
+    /// * `criteria_ref` — New criteria document reference or criteria ID.
+    ///
+    /// # Panics
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"EmptyCriteria"` if `criteria_ref` is empty.
+    /// - `"UnknownCampaign"` if the campaign does not exist.
+    /// - `"CampaignFinalized"` if the campaign is `Completed` or `Cancelled`.
+    pub fn update_criteria_ref(env: Env, campaign_id: u32, criteria_ref: Symbol) {
+        Self::assert_initialized(&env);
+        Self::assert_admin(&env);
+
+        if criteria_ref == symbol_short!("") {
+            panic!("EmptyCriteria");
+        }
+
+        let mut campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .unwrap_or_else(|| panic!("UnknownCampaign"));
+
+        if Self::is_finalized(campaign.status) {
+            panic!("CampaignFinalized");
+        }
+
+        campaign.criteria_ref = criteria_ref;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -291,6 +546,36 @@ impl CampaignVaultContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("NotInit"));
         admin.require_auth();
+    }
+
+    /// Whether `from` can legally transition to `to` under the campaign
+    /// lifecycle rules. A transition to the current state is invalid.
+    fn can_transition(from: CampaignStatus, to: CampaignStatus) -> bool {
+        if from == to {
+            return false;
+        }
+        match from {
+            CampaignStatus::Draft => {
+                matches!(to, CampaignStatus::Active | CampaignStatus::Cancelled)
+            }
+            CampaignStatus::Active => matches!(
+                to,
+                CampaignStatus::Paused | CampaignStatus::Completed | CampaignStatus::Cancelled
+            ),
+            CampaignStatus::Paused => matches!(
+                to,
+                CampaignStatus::Active | CampaignStatus::Completed | CampaignStatus::Cancelled
+            ),
+            CampaignStatus::Completed | CampaignStatus::Cancelled => false,
+        }
+    }
+
+    /// Whether a campaign is in a terminal state.
+    fn is_finalized(status: CampaignStatus) -> bool {
+        matches!(
+            status,
+            CampaignStatus::Completed | CampaignStatus::Cancelled
+        )
     }
 }
 
@@ -686,14 +971,14 @@ mod test {
             &200u64,
         );
 
-        // Force the campaign into the Closed state via direct storage access
+        // Force the campaign into the Completed state via direct storage access
         env.as_contract(&contract_id, || {
             let mut campaign: Campaign = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Campaign(id))
                 .unwrap();
-            campaign.status = CampaignStatus::Closed;
+            campaign.status = CampaignStatus::Completed;
             env.storage()
                 .persistent()
                 .set(&DataKey::Campaign(id), &campaign);
@@ -766,5 +1051,673 @@ mod test {
             }])
             .try_fund_campaign(&id, &sponsor, &100_i128);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #29 — Campaign lookup tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_campaign_ids_returns_created_ids() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.create_campaign(
+            &symbol_short!("chem"),
+            &sponsor,
+            &2_000_i128,
+            &symbol_short!("gpa25"),
+            &100u64,
+            &200u64,
+        );
+
+        let ids = client.get_campaign_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get(0).unwrap(), 1);
+        assert_eq!(ids.get(1).unwrap(), 2);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_get_campaign_ids_returns_empty_before_creation() {
+        let (env, client, _admin) = setup();
+        assert_eq!(client.get_campaign_ids().len(), 0);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_lookup_does_not_mutate_state() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        let before = client.get_campaign(&id).unwrap();
+        let _ = client.get_campaign(&id);
+        let after = client.get_campaign(&id).unwrap();
+        assert_eq!(before, after);
+        let _ = env;
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #31 — Campaign status management tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_campaign_status_active_to_paused() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        let status = client.update_campaign_status(&id, &CampaignStatus::Paused);
+        assert_eq!(status, CampaignStatus::Paused);
+        assert_eq!(
+            client.get_campaign(&id).unwrap().status,
+            CampaignStatus::Paused
+        );
+        let _ = env;
+    }
+
+    #[test]
+    fn test_update_campaign_status_paused_to_active() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.update_campaign_status(&id, &CampaignStatus::Paused);
+        let status = client.update_campaign_status(&id, &CampaignStatus::Active);
+        assert_eq!(status, CampaignStatus::Active);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_update_campaign_status_active_to_completed() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        let status = client.update_campaign_status(&id, &CampaignStatus::Completed);
+        assert_eq!(status, CampaignStatus::Completed);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_update_campaign_status_draft_to_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        // Force the campaign into the Draft state via direct storage access
+        env.as_contract(&contract_id, || {
+            let mut campaign: Campaign = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Campaign(id))
+                .unwrap();
+            campaign.status = CampaignStatus::Draft;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Campaign(id), &campaign);
+        });
+
+        let status = client.update_campaign_status(&id, &CampaignStatus::Active);
+        assert_eq!(status, CampaignStatus::Active);
+    }
+
+    #[test]
+    fn test_update_campaign_status_emits_event() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.update_campaign_status(&id, &CampaignStatus::Completed);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_contract_id, topics, _data) = events.get(0).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("status"));
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTransition")]
+    fn test_update_campaign_status_rejects_active_to_draft() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.update_campaign_status(&id, &CampaignStatus::Draft);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTransition")]
+    fn test_update_campaign_status_rejects_same_status() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.update_campaign_status(&id, &CampaignStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTransition")]
+    fn test_update_campaign_status_rejects_transition_from_completed() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.update_campaign_status(&id, &CampaignStatus::Completed);
+        client.update_campaign_status(&id, &CampaignStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnknownCampaign")]
+    fn test_update_campaign_status_rejects_unknown_campaign() {
+        let (_env, client, _admin) = setup();
+        client.update_campaign_status(&99, &CampaignStatus::Completed);
+    }
+
+    #[test]
+    fn test_update_campaign_status_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = create_campaign_with_auth(&env, &contract_id, &client, &admin, &sponsor);
+
+        // Authorize only a non-admin attacker for `update_campaign_status`
+        let attacker = Address::generate(&env);
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_campaign_status",
+                    args: (id, CampaignStatus::Completed).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_update_campaign_status(&id, &CampaignStatus::Completed);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #32 — Reward allocation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_campaign_reward_increases_allocated() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &800);
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &300);
+
+        assert_eq!(client.get_allocated(&id), 300);
+        assert_eq!(client.get_available_pool(&id), 500);
+        assert_eq!(client.get_student_allocation(&id, &student), 300);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_record_campaign_reward_tracks_per_student() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &1_000);
+
+        let student_a = Address::generate(&env);
+        let student_b = Address::generate(&env);
+        client.record_campaign_reward(&id, &student_a, &400);
+        client.record_campaign_reward(&id, &student_b, &600);
+
+        assert_eq!(client.get_allocated(&id), 1_000);
+        assert_eq!(client.get_student_allocation(&id, &student_a), 400);
+        assert_eq!(client.get_student_allocation(&id, &student_b), 600);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_record_campaign_reward_emits_event() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &500);
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &300);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+
+        let (_contract_id, topics, data) = events.get(1).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, symbol_short!("reward"));
+
+        let vals: Vec<Val> = data.try_into_val(&env).unwrap();
+        assert_eq!(vals.len(), 3);
+        let emitted_campaign: u32 = vals.get(0).unwrap().try_into_val(&env).unwrap();
+        let emitted_student: Address = vals.get(1).unwrap().try_into_val(&env).unwrap();
+        let emitted_amount: i128 = vals.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(emitted_campaign, id);
+        assert_eq!(emitted_student, student);
+        assert_eq!(emitted_amount, 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "ZeroAmount")]
+    fn test_record_campaign_reward_rejects_zero_amount() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &500);
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientPool")]
+    fn test_record_campaign_reward_rejects_over_allocation() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &500);
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &300);
+        client.record_campaign_reward(&id, &student, &300);
+    }
+
+    #[test]
+    #[should_panic(expected = "InsufficientPool")]
+    fn test_record_campaign_reward_rejects_allocation_without_funding() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnknownCampaign")]
+    fn test_record_campaign_reward_rejects_unknown_campaign() {
+        let (env, client, _admin) = setup();
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&99, &student, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "CampaignClosed")]
+    fn test_record_campaign_reward_rejects_completed_campaign() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &500);
+
+        // Force the campaign into the Completed state via direct storage access
+        env.as_contract(&contract_id, || {
+            let mut campaign: Campaign = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Campaign(id))
+                .unwrap();
+            campaign.status = CampaignStatus::Completed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Campaign(id), &campaign);
+        });
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &100);
+    }
+
+    #[test]
+    fn test_record_campaign_reward_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = create_campaign_with_auth(&env, &contract_id, &client, &admin, &sponsor);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "fund_campaign",
+                    args: (id, sponsor.clone(), 500_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .fund_campaign(&id, &sponsor, &500);
+
+        // Authorize only a non-admin attacker for `record_campaign_reward`
+        let attacker = Address::generate(&env);
+        let student = Address::generate(&env);
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "record_campaign_reward",
+                    args: (id, student.clone(), 100_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_record_campaign_reward(&id, &student, &100_i128);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #33 — Criteria reference tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "EmptyCriteria")]
+    fn test_create_campaign_rejects_empty_criteria_ref() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &Symbol::new(&env, ""),
+            &100u64,
+            &200u64,
+        );
+    }
+
+    #[test]
+    fn test_update_criteria_ref_success() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        client.update_criteria_ref(&id, &symbol_short!("gpa35"));
+        assert_eq!(
+            client.get_campaign(&id).unwrap().criteria_ref,
+            symbol_short!("gpa35")
+        );
+        let _ = env;
+    }
+
+    #[test]
+    #[should_panic(expected = "EmptyCriteria")]
+    fn test_update_criteria_ref_rejects_empty() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.update_criteria_ref(&id, &Symbol::new(&env, ""));
+    }
+
+    #[test]
+    #[should_panic(expected = "CampaignFinalized")]
+    fn test_update_criteria_ref_rejects_finalized_campaign() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.update_campaign_status(&id, &CampaignStatus::Completed);
+        client.update_criteria_ref(&id, &symbol_short!("gpa35"));
+    }
+
+    #[test]
+    #[should_panic(expected = "UnknownCampaign")]
+    fn test_update_criteria_ref_rejects_unknown_campaign() {
+        let (_env, client, _admin) = setup();
+        client.update_criteria_ref(&99, &symbol_short!("gpa35"));
+    }
+
+    #[test]
+    fn test_update_criteria_ref_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, CampaignVaultContract);
+        let client = CampaignVaultContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let sponsor = Address::generate(&env);
+        let id = create_campaign_with_auth(&env, &contract_id, &client, &admin, &sponsor);
+
+        // Authorize only a non-admin attacker for `update_criteria_ref`
+        let attacker = Address::generate(&env);
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_criteria_ref",
+                    args: (id, symbol_short!("gpa35")).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_update_criteria_ref(&id, &symbol_short!("gpa35"));
+        assert!(result.is_err());
+    }
+
+    /// Create a campaign as the admin using explicit `MockAuth`, returning its ID.
+    fn create_campaign_with_auth(
+        env: &Env,
+        contract_id: &Address,
+        client: &CampaignVaultContractClient<'static>,
+        admin: &Address,
+        sponsor: &Address,
+    ) -> u32 {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "create_campaign",
+                    args: (
+                        symbol_short!("math"),
+                        sponsor.clone(),
+                        1_000_i128,
+                        symbol_short!("gpa30"),
+                        100u64,
+                        200u64,
+                    )
+                        .into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_campaign(
+                &symbol_short!("math"),
+                sponsor,
+                &1_000_i128,
+                &symbol_short!("gpa30"),
+                &100u64,
+                &200u64,
+            )
+            .unwrap()
+            .unwrap()
     }
 }
