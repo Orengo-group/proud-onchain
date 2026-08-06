@@ -11,6 +11,7 @@
 //! - Campaign lifecycle status management (issue #31)
 //! - Campaign reward allocation tracking (issue #32)
 //! - Campaign criteria reference handling (issue #33)
+//! - Campaign closeout summary lookup (issue #34)
 //!
 //! ## Storage Keys
 //! - `DataKey::Initialized`     — `bool`    — guards one-time init
@@ -91,6 +92,22 @@ pub struct Campaign {
     /// Campaign end date (Unix seconds).
     pub end_date: u64,
     /// Current lifecycle state.
+    pub status: CampaignStatus,
+}
+
+/// Closeout summary of a campaign's reward pool (issue #34).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CampaignSummary {
+    /// Unique numeric campaign identifier.
+    pub campaign_id: u32,
+    /// Total reward amount funded into the campaign pool.
+    pub funded: i128,
+    /// Total reward amount distributed to students.
+    pub distributed: i128,
+    /// Remaining pool available for allocation (`funded - distributed`).
+    pub remaining: i128,
+    /// Current lifecycle state of the campaign.
     pub status: CampaignStatus,
 }
 
@@ -484,6 +501,46 @@ impl CampaignVaultContract {
         let pool = Self::get_pool(env.clone(), campaign_id);
         let allocated = Self::get_allocated(env, campaign_id);
         pool - allocated
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #34 — Campaign closeout summary
+    // -----------------------------------------------------------------------
+
+    /// Return a closeout [`CampaignSummary`] for `campaign_id`.
+    ///
+    /// Read-only lookup that reports the total funded amount, the total
+    /// distributed amount, the remaining pool, and the campaign's current
+    /// lifecycle status. Works for campaigns in any state, including
+    /// finalized (`Completed` or `Cancelled`) campaigns.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — Target campaign ID.
+    ///
+    /// # Returns
+    /// A [`CampaignSummary`] with `funded = pool`, `distributed = allocated`,
+    /// and `remaining = funded - distributed`.
+    ///
+    /// # Panics
+    /// - `"UnknownCampaign"` if the campaign does not exist.
+    pub fn get_campaign_summary(env: Env, campaign_id: u32) -> CampaignSummary {
+        let campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .unwrap_or_else(|| panic!("UnknownCampaign"));
+
+        let funded = Self::get_pool(env.clone(), campaign_id);
+        let distributed = Self::get_allocated(env.clone(), campaign_id);
+        let remaining = funded - distributed;
+
+        CampaignSummary {
+            campaign_id,
+            funded,
+            distributed,
+            remaining,
+            status: campaign.status,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1681,6 +1738,109 @@ mod test {
             }])
             .try_update_criteria_ref(&id, &symbol_short!("gpa35"));
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #34 — Campaign closeout summary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_campaign_summary_reports_funded_distributed_remaining() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &800);
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &300);
+
+        let summary = client.get_campaign_summary(&id);
+        assert_eq!(summary.campaign_id, id);
+        assert_eq!(summary.funded, 800);
+        assert_eq!(summary.distributed, 300);
+        assert_eq!(summary.remaining, 500);
+        assert_eq!(summary.status, CampaignStatus::Active);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_get_campaign_summary_reports_zero_amounts_for_unfunded() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+
+        let summary = client.get_campaign_summary(&id);
+        assert_eq!(summary.funded, 0);
+        assert_eq!(summary.distributed, 0);
+        assert_eq!(summary.remaining, 0);
+        assert_eq!(summary.status, CampaignStatus::Active);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_get_campaign_summary_reports_finalized_status() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &1_000);
+        client.update_campaign_status(&id, &CampaignStatus::Completed);
+
+        let summary = client.get_campaign_summary(&id);
+        assert_eq!(summary.funded, 1_000);
+        assert_eq!(summary.status, CampaignStatus::Completed);
+        let _ = env;
+    }
+
+    #[test]
+    fn test_get_campaign_summary_matches_individual_getters() {
+        let (env, client, _admin) = setup();
+        let sponsor = Address::generate(&env);
+        let id = client.create_campaign(
+            &symbol_short!("math"),
+            &sponsor,
+            &1_000_i128,
+            &symbol_short!("gpa30"),
+            &100u64,
+            &200u64,
+        );
+        client.fund_campaign(&id, &sponsor, &750);
+
+        let student = Address::generate(&env);
+        client.record_campaign_reward(&id, &student, &250);
+
+        let summary = client.get_campaign_summary(&id);
+        assert_eq!(summary.funded, client.get_pool(&id));
+        assert_eq!(summary.distributed, client.get_allocated(&id));
+        assert_eq!(summary.remaining, client.get_available_pool(&id));
+        let _ = env;
+    }
+
+    #[test]
+    #[should_panic(expected = "UnknownCampaign")]
+    fn test_get_campaign_summary_rejects_unknown_campaign() {
+        let (_env, client, _admin) = setup();
+        client.get_campaign_summary(&99);
     }
 
     /// Create a campaign as the admin using explicit `MockAuth`, returning its ID.
