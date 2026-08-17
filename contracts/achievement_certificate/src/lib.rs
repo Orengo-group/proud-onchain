@@ -403,6 +403,10 @@ mod test {
         client.issue_achievement(&student, &empty_title, &category, &hash);
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #38 — get_achievement tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_get_achievement_returns_none_for_unknown() {
         let env = Env::default();
@@ -412,6 +416,108 @@ mod test {
     }
 
     #[test]
+    fn test_get_achievement_returns_existing_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("TopSci");
+        let category = symbol_short!("academic");
+        let metadata_hash = make_hash(&env, 0xBB);
+
+        let id = client.issue_achievement(&student, &title, &category, &metadata_hash);
+
+        let record = client.get_achievement(&id).unwrap();
+        assert_eq!(record.achievement_id, id);
+        assert_eq!(record.student, student);
+        assert_eq!(record.title, title);
+        assert_eq!(record.category, category);
+        assert_eq!(record.metadata_hash, metadata_hash);
+        assert_eq!(record.issued_at, env.ledger().sequence() as u64);
+    }
+
+    #[test]
+    fn test_get_achievement_returns_correct_record_for_each_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student_a = Address::generate(&env);
+        let student_b = Address::generate(&env);
+        let title1 = symbol_short!("Math");
+        let title2 = symbol_short!("Science");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id1 = client.issue_achievement(&student_a, &title1, &category, &hash);
+        let id2 = client.issue_achievement(&student_b, &title2, &category, &hash);
+
+        let record1 = client.get_achievement(&id1).unwrap();
+        let record2 = client.get_achievement(&id2).unwrap();
+
+        assert_eq!(record1.student, student_a);
+        assert_eq!(record1.title, title1);
+        assert_eq!(record2.student, student_b);
+        assert_eq!(record2.title, title2);
+    }
+
+    #[test]
+    fn test_get_achievement_does_not_mutate_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Physics");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0xCC);
+
+        let id = client.issue_achievement(&student, &title, &category, &hash);
+
+        // Lookup before — snapshot the result
+        let before = client.get_achievement(&id).unwrap();
+        let student_achievements_before = client.get_student_achievements(&student);
+
+        // Call get_achievement multiple times
+        let _ = client.get_achievement(&id);
+        let _ = client.get_achievement(&id);
+        let _ = client.get_achievement(&0);
+
+        // Verify state is unchanged
+        let after = client.get_achievement(&id).unwrap();
+        let student_achievements_after = client.get_student_achievements(&student);
+
+        assert_eq!(before, after);
+        assert_eq!(student_achievements_before.len(), student_achievements_after.len());
+        assert_eq!(
+            student_achievements_before.get_unchecked(0),
+            student_achievements_after.get_unchecked(0)
+        );
+    }
+
+    #[test]
+    fn test_get_achievement_returns_none_for_id_zero() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        assert!(client.get_achievement(&0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #39 — get_student_achievements tests
+    // -----------------------------------------------------------------------
+
+    #[test]
     fn test_get_student_achievements_returns_empty_for_unknown() {
         let env = Env::default();
         let contract_id = env.register_contract(None, AchievementCertificateContract);
@@ -419,6 +525,61 @@ mod test {
         let student = Address::generate(&env);
         let achievements = client.get_student_achievements(&student);
         assert_eq!(achievements.len(), 0);
+    }
+
+    #[test]
+    fn test_get_student_achievements_returns_ids_in_order() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id1 = client.issue_achievement(&student, &title, &category, &hash);
+        let id2 = client.issue_achievement(&student, &title, &category, &hash);
+        let id3 = client.issue_achievement(&student, &title, &category, &hash);
+
+        let achievements = client.get_student_achievements(&student);
+        assert_eq!(achievements.len(), 3);
+        assert_eq!(achievements.get_unchecked(0), id1);
+        assert_eq!(achievements.get_unchecked(1), id2);
+        assert_eq!(achievements.get_unchecked(2), id3);
+    }
+
+    #[test]
+    fn test_issue_achievement_updates_student_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        // Initially empty
+        assert_eq!(client.get_student_achievements(&student).len(), 0);
+
+        // Issue first achievement — index should grow to 1
+        let id1 = client.issue_achievement(&student, &title, &category, &hash);
+        let achievements = client.get_student_achievements(&student);
+        assert_eq!(achievements.len(), 1);
+        assert_eq!(achievements.get_unchecked(0), id1);
+
+        // Issue second achievement — index should grow to 2
+        let id2 = client.issue_achievement(&student, &title, &category, &hash);
+        let achievements = client.get_student_achievements(&student);
+        assert_eq!(achievements.len(), 2);
+        assert_eq!(achievements.get_unchecked(1), id2);
     }
 
     #[test]
@@ -445,5 +606,36 @@ mod test {
 
         assert_eq!(a_achievements.len(), 2);
         assert_eq!(b_achievements.len(), 1);
+    }
+
+    #[test]
+    fn test_get_student_achievements_consistent_across_calls() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        client.issue_achievement(&student, &title, &category, &hash);
+        client.issue_achievement(&student, &title, &category, &hash);
+
+        let first_call = client.get_student_achievements(&student);
+        let second_call = client.get_student_achievements(&student);
+
+        assert_eq!(first_call.len(), second_call.len());
+        assert_eq!(
+            first_call.get_unchecked(0),
+            second_call.get_unchecked(0)
+        );
+        assert_eq!(
+            first_call.get_unchecked(1),
+            second_call.get_unchecked(1)
+        );
     }
 }
