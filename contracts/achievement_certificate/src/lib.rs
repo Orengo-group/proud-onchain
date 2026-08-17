@@ -3,35 +3,447 @@
 //! Issues verifiable on-chain certificates for student academic achievements.
 //!
 //! ## Responsibilities
-//! - Mint achievement certificates as on-chain records
-//! - Allow public verification of a certificate by student address
-//! - Support certificate revocation by authorized admins
+//! - Initialize the contract with an admin address (one-time only)
+//! - Issue achievement certificates as on-chain records
+//! - Allow public verification of certificates by student address
+//! - Restrict issuance to the admin set at initialization
+//!
+//! ## Storage Keys
+//! - `DataKey::Initialized`              — `bool`  — guards one-time init
+//! - `DataKey::Admin`                    — `Address` — contract administrator
+//! - `DataKey::Achievement(u64)`         — `AchievementRecord` — per-achievement record
+//! - `DataKey::AchievementIndex(u64)`    — `u64` — unique achievement ID counter
+//! - `DataKey::StudentAchievements(Address)` — `Vec<u64>` — list of achievement IDs per student
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, Env, Symbol, symbol_short};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, symbol_short, Vec};
+
+// ---------------------------------------------------------------------------
+// Storage key enum
+// ---------------------------------------------------------------------------
+
+/// All persistent storage keys used by this contract.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Whether `initialize` has already been called.
+    Initialized,
+    /// The admin address set during initialization.
+    Admin,
+    /// Achievement ID counter (auto-incrementing).
+    AchievementIdCounter,
+    /// Per-achievement record, keyed by the unique achievement ID.
+    Achievement(u64),
+    /// List of achievement IDs for a given student wallet.
+    StudentAchievements(Address),
+}
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+/// Represents an issued achievement certificate on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AchievementRecord {
+    /// Unique auto-incrementing achievement ID.
+    pub achievement_id: u64,
+    /// The student's Stellar wallet address.
+    pub student: Address,
+    /// Title of the achievement (e.g. "Best in Mathematics").
+    pub title: Symbol,
+    /// Category of the achievement (e.g. "academic", "extracurricular").
+    pub category: Symbol,
+    /// SHA-256 hash of off-chain metadata (e.g. certificate PDF).
+    pub metadata_hash: BytesN<32>,
+    /// Timestamp (ledger close time) when the achievement was issued.
+    pub issued_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
 
 #[contract]
 pub struct AchievementCertificateContract;
 
 #[contractimpl]
 impl AchievementCertificateContract {
-    /// Placeholder: issue an achievement certificate.
-    pub fn issue(_env: Env) -> Symbol {
-        symbol_short!("ok")
+    // -----------------------------------------------------------------------
+    // Issue #36 — Initialization (one-time only)
+    // -----------------------------------------------------------------------
+
+    /// Initialize the contract with an admin address.
+    ///
+    /// Can only be called once. Subsequent calls will panic with `"AlreadyInit"`.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Initialized) {
+            panic!("AlreadyInit");
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::AchievementIdCounter, &0u64);
+    }
+
+    /// Return the admin address stored during initialization.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #37 — Achievement issuance (admin only)
+    // -----------------------------------------------------------------------
+
+    /// Issue a new achievement certificate to a student.
+    ///
+    /// Only the contract admin may issue achievements. Each issued achievement
+    /// is assigned a unique auto-incrementing ID. An event is emitted with the
+    /// student wallet and achievement ID.
+    ///
+    /// Panics:
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"EmptyTitle"` if the title is empty.
+    pub fn issue_achievement(
+        env: Env,
+        student: Address,
+        title: Symbol,
+        category: Symbol,
+        metadata_hash: BytesN<32>,
+    ) -> u64 {
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            panic!("NotInit");
+        }
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"));
+        admin.require_auth();
+
+        if title == symbol_short!("") {
+            panic!("EmptyTitle");
+        }
+
+        // Increment the achievement ID counter
+        let achievement_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AchievementIdCounter)
+            .unwrap_or(0u64);
+        let next_id = achievement_id + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::AchievementIdCounter, &next_id);
+
+        // Record the achievement
+        let issued_at = env.ledger().sequence() as u64;
+        let record = AchievementRecord {
+            achievement_id: next_id,
+            student: student.clone(),
+            title: title.clone(),
+            category: category.clone(),
+            metadata_hash: metadata_hash.clone(),
+            issued_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Achievement(next_id), &record);
+
+        // Update the student's achievement list
+        let mut student_achievements: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StudentAchievements(student.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        student_achievements.push_back(next_id);
+        env.storage().persistent().set(
+            &DataKey::StudentAchievements(student.clone()),
+            &student_achievements,
+        );
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("achieve"),),
+            (next_id, student, title, category, metadata_hash, issued_at),
+        );
+
+        next_id
+    }
+
+    // -----------------------------------------------------------------------
+    // Read functions
+    // -----------------------------------------------------------------------
+
+    /// Retrieve an achievement record by its ID.
+    ///
+    /// Returns `Some(AchievementRecord)` if found, or `None` if no achievement
+    /// with that ID exists.
+    pub fn get_achievement(env: Env, achievement_id: u64) -> Option<AchievementRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Achievement(achievement_id))
+    }
+
+    /// Retrieve all achievement IDs for a given student wallet.
+    pub fn get_student_achievements(env: Env, student: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StudentAchievements(student))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::{
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        Address, BytesN, Env, IntoVal,
+    };
+
+    /// Helper — build a BytesN<32> filled with a single byte value.
+    fn make_hash(env: &Env, val: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[val; 32])
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #36 — Initialization tests
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_issue_placeholder() {
+    fn test_initialize_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyInit")]
+    fn test_initialize_rejects_double_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        client.initialize(&admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "NotInit")]
+    fn test_get_admin_rejects_uninitialized() {
         let env = Env::default();
         let contract_id = env.register_contract(None, AchievementCertificateContract);
         let client = AchievementCertificateContractClient::new(&env, &contract_id);
-        let result = client.issue();
-        assert_eq!(result, symbol_short!("ok"));
+        client.get_admin();
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #37 — issue_achievement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_issue_achievement_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("BestMath");
+        let category = symbol_short!("academic");
+        let metadata_hash = make_hash(&env, 0xAA);
+
+        let id = client.issue_achievement(&student, &title, &category, &metadata_hash);
+        assert_eq!(id, 1);
+
+        let record = client.get_achievement(&id).unwrap();
+        assert_eq!(record.achievement_id, 1);
+        assert_eq!(record.student, student);
+        assert_eq!(record.title, title);
+        assert_eq!(record.category, category);
+        assert_eq!(record.metadata_hash, metadata_hash);
+        assert_eq!(record.issued_at, env.ledger().sequence() as u64);
+    }
+
+    #[test]
+    fn test_issue_multiple_achievements_increment_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id1 = client.issue_achievement(&student, &title, &category, &hash);
+        let id2 = client.issue_achievement(&student, &title, &category, &hash);
+        let id3 = client.issue_achievement(&student, &title, &category, &hash);
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn test_issue_achievement_stored_in_student_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id1 = client.issue_achievement(&student, &title, &category, &hash);
+        let id2 = client.issue_achievement(&student, &title, &category, &hash);
+
+        let achievements = client.get_student_achievements(&student);
+        assert_eq!(achievements.len(), 2);
+        assert_eq!(achievements.get_unchecked(0), id1);
+        assert_eq!(achievements.get_unchecked(1), id2);
+    }
+
+    #[test]
+    #[should_panic(expected = "NotInit")]
+    fn test_issue_achievement_rejects_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        client.issue_achievement(&student, &title, &category, &hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_issue_achievement_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Authorize only the admin for `initialize`
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        // Attempt to issue as a non-admin — must fail
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "issue_achievement",
+                    args: (student.clone(), title.clone(), category.clone(), hash.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .issue_achievement(&student, &title, &category, &hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "EmptyTitle")]
+    fn test_issue_achievement_rejects_empty_title() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let empty_title = Symbol::new(&env, "");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        client.issue_achievement(&student, &empty_title, &category, &hash);
+    }
+
+    #[test]
+    fn test_get_achievement_returns_none_for_unknown() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        assert!(client.get_achievement(&999).is_none());
+    }
+
+    #[test]
+    fn test_get_student_achievements_returns_empty_for_unknown() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let student = Address::generate(&env);
+        let achievements = client.get_student_achievements(&student);
+        assert_eq!(achievements.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_students_separate_achievement_lists() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student_a = Address::generate(&env);
+        let student_b = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        client.issue_achievement(&student_a, &title, &category, &hash);
+        client.issue_achievement(&student_a, &title, &category, &hash);
+        client.issue_achievement(&student_b, &title, &category, &hash);
+
+        let a_achievements = client.get_student_achievements(&student_a);
+        let b_achievements = client.get_student_achievements(&student_b);
+
+        assert_eq!(a_achievements.len(), 2);
+        assert_eq!(b_achievements.len(), 1);
     }
 }
