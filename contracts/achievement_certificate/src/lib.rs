@@ -16,7 +16,9 @@
 //! - `DataKey::StudentAchievements(Address)` — `Vec<u64>` — list of achievement IDs per student
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, symbol_short, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key enum
@@ -58,6 +60,8 @@ pub struct AchievementRecord {
     pub metadata_hash: BytesN<32>,
     /// Timestamp (ledger close time) when the achievement was issued.
     pub issued_at: u64,
+    /// Whether this achievement has been revoked by an admin.
+    pub revoked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +87,9 @@ impl AchievementCertificateContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::AchievementIdCounter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::AchievementIdCounter, &0u64);
     }
 
     /// Return the admin address stored during initialization.
@@ -150,6 +156,7 @@ impl AchievementCertificateContract {
             category: category.clone(),
             metadata_hash: metadata_hash.clone(),
             issued_at,
+            revoked: false,
         };
         env.storage()
             .persistent()
@@ -196,6 +203,55 @@ impl AchievementCertificateContract {
             .persistent()
             .get(&DataKey::StudentAchievements(student))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #40 — Achievement revocation (admin only)
+    // -----------------------------------------------------------------------
+
+    /// Revoke an issued achievement certificate.
+    ///
+    /// Only the contract admin may revoke achievements. The achievement record
+    /// remains readable after revocation but its `revoked` flag is set to
+    /// `true`. An event is emitted with the revoked achievement ID.
+    ///
+    /// Panics:
+    /// - `"NotInit"` if the contract has not been initialized.
+    /// - `"Unauthorized"` if the caller is not the admin.
+    /// - `"AchievementNotFound"` if the achievement ID does not exist.
+    /// - `"AlreadyRevoked"` if the achievement has already been revoked.
+    pub fn revoke_achievement(env: Env, achievement_id: u64) {
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            panic!("NotInit");
+        }
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("NotInit"));
+        admin.require_auth();
+
+        let mut record: AchievementRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Achievement(achievement_id))
+            .unwrap_or_else(|| panic!("AchievementNotFound"));
+
+        if record.revoked {
+            panic!("AlreadyRevoked");
+        }
+
+        record.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Achievement(achievement_id), &record);
+
+        // Emit revocation event
+        env.events().publish(
+            (symbol_short!("revoke"),),
+            (achievement_id, record.student, record.title),
+        );
     }
 }
 
@@ -378,7 +434,13 @@ mod test {
                 invoke: &MockAuthInvoke {
                     contract: &contract_id,
                     fn_name: "issue_achievement",
-                    args: (student.clone(), title.clone(), category.clone(), hash.clone()).into_val(&env),
+                    args: (
+                        student.clone(),
+                        title.clone(),
+                        category.clone(),
+                        hash.clone(),
+                    )
+                        .into_val(&env),
                     sub_invokes: &[],
                 },
             }])
@@ -498,7 +560,10 @@ mod test {
         let student_achievements_after = client.get_student_achievements(&student);
 
         assert_eq!(before, after);
-        assert_eq!(student_achievements_before.len(), student_achievements_after.len());
+        assert_eq!(
+            student_achievements_before.len(),
+            student_achievements_after.len()
+        );
         assert_eq!(
             student_achievements_before.get_unchecked(0),
             student_achievements_after.get_unchecked(0)
@@ -629,13 +694,204 @@ mod test {
         let second_call = client.get_student_achievements(&student);
 
         assert_eq!(first_call.len(), second_call.len());
-        assert_eq!(
-            first_call.get_unchecked(0),
-            second_call.get_unchecked(0)
-        );
-        assert_eq!(
-            first_call.get_unchecked(1),
-            second_call.get_unchecked(1)
-        );
+        assert_eq!(first_call.get_unchecked(0), second_call.get_unchecked(0));
+        assert_eq!(first_call.get_unchecked(1), second_call.get_unchecked(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #40 — revoke_achievement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_revoke_achievement_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("BestMath");
+        let category = symbol_short!("academic");
+        let metadata_hash = make_hash(&env, 0xAA);
+
+        let id = client.issue_achievement(&student, &title, &category, &metadata_hash);
+        let record_before = client.get_achievement(&id).unwrap();
+        assert!(!record_before.revoked);
+
+        client.revoke_achievement(&id);
+
+        let record_after = client.get_achievement(&id).unwrap();
+        assert!(record_after.revoked);
+        assert_eq!(record_after.achievement_id, id);
+        assert_eq!(record_after.student, student);
+        assert_eq!(record_after.title, title);
+        assert_eq!(record_after.category, category);
+        assert_eq!(record_after.metadata_hash, metadata_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError")]
+    fn test_revoke_achievement_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Authorize only the admin for `initialize`
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        // Issue an achievement as admin
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "issue_achievement",
+                    args: (
+                        student.clone(),
+                        title.clone(),
+                        category.clone(),
+                        hash.clone(),
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .issue_achievement(&student, &title, &category, &hash);
+
+        // Attempt to revoke as a non-admin — must fail
+        client
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "revoke_achievement",
+                    args: (id,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .revoke_achievement(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "NotInit")]
+    fn test_revoke_achievement_rejects_uninitialized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        client.revoke_achievement(&1);
+    }
+
+    #[test]
+    #[should_panic(expected = "AchievementNotFound")]
+    fn test_revoke_achievement_rejects_unknown_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.revoke_achievement(&999);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlreadyRevoked")]
+    fn test_revoke_achievement_rejects_double_revoke() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id = client.issue_achievement(&student, &title, &category, &hash);
+        client.revoke_achievement(&id);
+        client.revoke_achievement(&id);
+    }
+
+    #[test]
+    fn test_revoked_achievement_remains_readable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Physics");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0xBB);
+
+        let id = client.issue_achievement(&student, &title, &category, &hash);
+        client.revoke_achievement(&id);
+
+        // Record is still accessible and contains all original data
+        let record = client.get_achievement(&id).unwrap();
+        assert_eq!(record.achievement_id, id);
+        assert_eq!(record.student, student);
+        assert_eq!(record.title, title);
+        assert_eq!(record.category, category);
+        assert_eq!(record.metadata_hash, hash);
+        assert_eq!(record.issued_at, env.ledger().sequence() as u64);
+        assert!(record.revoked);
+
+        // Student's achievement list is unchanged
+        let student_achievements = client.get_student_achievements(&student);
+        assert_eq!(student_achievements.len(), 1);
+        assert_eq!(student_achievements.get_unchecked(0), id);
+    }
+
+    #[test]
+    fn test_revocation_does_not_affect_other_achievements() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AchievementCertificateContract);
+        let client = AchievementCertificateContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let student = Address::generate(&env);
+        let title = symbol_short!("Award");
+        let category = symbol_short!("academic");
+        let hash = make_hash(&env, 0x01);
+
+        let id1 = client.issue_achievement(&student, &title, &category, &hash);
+        let id2 = client.issue_achievement(&student, &title, &category, &hash);
+        let id3 = client.issue_achievement(&student, &title, &category, &hash);
+
+        client.revoke_achievement(&id2);
+
+        let record1 = client.get_achievement(&id1).unwrap();
+        let record2 = client.get_achievement(&id2).unwrap();
+        let record3 = client.get_achievement(&id3).unwrap();
+
+        assert!(!record1.revoked);
+        assert!(record2.revoked);
+        assert!(!record3.revoked);
     }
 }
