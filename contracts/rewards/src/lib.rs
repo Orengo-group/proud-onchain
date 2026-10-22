@@ -638,6 +638,8 @@ mod test {
             assert!(expected_recipients.contains(&recipient));
             assert!(expected_amounts.contains(amount));
         }
+    }
+
     #[test]
     fn test_get_balance_returns_stored_value() {
         let (env, client, _admin) = setup();
