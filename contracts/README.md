@@ -17,10 +17,10 @@ contracts/
 
 | Contract | Purpose |
 |---|---|
-| `rewards` | Evaluates eligibility criteria (attendance %, grade threshold) and distributes token rewards |
-| `identity_registry` | Registers NFC UIDs to student addresses; admin-controlled |
-| `campaign_vault` | Accepts sponsor deposits per campaign and releases funds on trigger |
-| `achievement_certificate` | Issues and verifies on-chain academic certificates |
+| `rewards` | Keeps a point balance per wallet. The admin mints points to one or many wallets with a reason (`Attendance`, `Academic`, `Event`) and can burn them on redemption. |
+| `identity_registry` | Maps a hashed NFC UID to a student ID and a Stellar wallet. Admin-only writes; duplicate student IDs, NFC hashes and wallets are rejected. |
+| `campaign_vault` | Records sponsor-funded campaigns: funding totals, lifecycle status, reward allocations against the funded pool, and a closeout summary. It records amounts; it does not custody or transfer tokens. |
+| `achievement_certificate` | Issues numbered achievement records per student and lets the admin revoke them. The record stays readable after revocation, flagged as revoked. |
 
 ## Building
 
